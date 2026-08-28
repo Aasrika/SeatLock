@@ -1,0 +1,68 @@
+[project]
+name = "seatlock"
+version = "0.1.0"
+description = "A concurrency-safe event ticketing system."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "alembic",
+    "redis",
+    "pydantic",
+    "pydantic-settings",
+    "structlog",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "testcontainers[postgres,redis]",
+    "hypothesis",
+    "ruff",
+    "mypy",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*", "workers*", "loadtest*"]
+
+# ---------------------------------------------------------------------------
+# Ruff — lint + format
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["docs/"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+
+# ---------------------------------------------------------------------------
+# mypy — strict scoped to app/domain/ only (pure Python, zero I/O, so it is
+# the one place a full strict pass is actually achievable and meaningful).
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "app.domain.*"
+strict = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Session-scoped so integration tests can share one event loop across a
+# session-scoped testcontainers fixture (an async engine created in one
+# test's loop cannot be reused from a different loop in another test).
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]

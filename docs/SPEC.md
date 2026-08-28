@@ -45,7 +45,7 @@ app/
   payments/      # webhook ingestion, event dedup, reconciliation
   admission/     # rate limiting, virtual waiting room
   realtime/      # WebSocket fanout, Redis pub/sub
-  platform/      # db session, redis client, idempotency, observability
+  infra/         # db session, redis client, idempotency, observability
   api/           # FastAPI routers — thin, no business logic
 workers/         # background jobs: hold sweeper, reconciler
 loadtest/        # k6 / Locust scenarios

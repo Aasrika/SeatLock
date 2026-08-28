@@ -39,3 +39,8 @@ Full spec: docs/SPEC.md — read the relevant section before implementing.
 - Small commits, one concern each.
 - Write tests alongside code, never as an afterthought.
 - If unsure whether something violates a rule above, ask. Do not guess.
+
+## Deviations from docs/SPEC.md
+- SPEC.md section 2 originally named this package `app/platform/`. It is
+  `app/infra/` instead — `platform` shadows a Python stdlib module. SPEC.md
+  has been updated to match; this note is the record of why.
