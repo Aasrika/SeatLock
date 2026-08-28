@@ -63,7 +63,11 @@ def build_seat_rows(event_id: int, total_seats: int) -> list[dict[str, Any]]:
     return rows
 
 
-async def seed(event_name: str, total_seats: int) -> None:
+async def seed(event_name: str, total_seats: int) -> int:
+    """Create an event with `total_seats` seats. Returns the new event id
+    (loadtest/run_benchmark.py calls this directly to get it without
+    scraping CLI output).
+    """
     async with async_session_factory() as session:
         result = await session.execute(
             insert(EventRow).returning(EventRow.id),
@@ -80,6 +84,7 @@ async def seed(event_name: str, total_seats: int) -> None:
         await session.commit()
 
     print(f"Seeded event {event_id} ({event_name!r}) with {total_seats} seats.")
+    return event_id
 
 
 def main() -> None:
