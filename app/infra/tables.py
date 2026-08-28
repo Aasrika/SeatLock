@@ -178,3 +178,28 @@ class BookingSeatRow(Base):
             postgresql_where=text("released_at IS NULL"),
         ),
     )
+
+
+class HoldAuditRow(Base):
+    """Diagnostic-only: one row per *successful* acquire(), regardless of
+    strategy or whether the acquisition should have succeeded.
+
+    This is not part of SPEC.md's core schema -- it exists so Phase 1's
+    naive strategy's oversell can be proven after the fact. `seats` only
+    ever shows the last write for a given seat, which hides a transient
+    double-acquisition (two sessions both briefly believing they hold the
+    same seat). hold_audit is append-only, so
+    `GET /api/admin/oversell-report` can find every session that ever
+    successfully held a given seat and flag any seat with more than one.
+    """
+
+    __tablename__ = "hold_audit"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    seat_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("seats.id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[str] = mapped_column(String, nullable=False)
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index(None, "seat_id"),)
