@@ -4,10 +4,14 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.api.routes import admin, booking
 from app.infra.db import engine
 from app.infra.redis import get_redis
 
 app = FastAPI(title="Seatlock")
+
+app.include_router(booking.router, prefix="/api", tags=["booking"])
+app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 
 
 @app.get("/health")
