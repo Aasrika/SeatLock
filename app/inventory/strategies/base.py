@@ -56,11 +56,11 @@ def get_strategy(name: str) -> SeatAcquisitionStrategy:
     """Look up a strategy by name (see Settings.strategy / STRATEGY env var).
 
     Deferred imports below are deliberate: they keep this module import-
-    light and, more importantly, prove the wiring works end-to-end for
-    strategies that don't exist yet -- selecting "pessimistic" or
-    "optimistic" today raises NotImplementedError rather than an ImportError
-    or AttributeError, which would leave it ambiguous whether the config
-    plumbing or the strategy itself was the missing piece.
+    light, and originally also proved the selection wiring worked
+    end-to-end before "pessimistic"/"optimistic" existed (they raised
+    NotImplementedError rather than an ImportError or AttributeError,
+    which would have left it ambiguous whether the config plumbing or the
+    strategy itself was the missing piece). All three now exist.
     """
     if name == "naive":
         from app.inventory.strategies.naive import NaiveStrategy
@@ -71,5 +71,7 @@ def get_strategy(name: str) -> SeatAcquisitionStrategy:
 
         return PessimisticStrategy()
     if name == "optimistic":
-        raise NotImplementedError("Optimistic locking strategy is Phase 3.")
+        from app.inventory.strategies.optimistic import OptimisticStrategy
+
+        return OptimisticStrategy()
     raise ValueError(f"Unknown strategy: {name!r}")
