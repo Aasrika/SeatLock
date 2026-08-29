@@ -24,6 +24,21 @@ class AcquireResult:
     reason: str | None = None
 
 
+class StrategyUnavailable(Exception):
+    """A strategy could not complete an acquire() due to an infrastructure
+    condition -- a lock timeout, a deadlock, a connection failure -- not a
+    business decision about seat availability.
+
+    Deliberately NOT an AcquireResult(success=False, ...): that shape means
+    "we checked, and the seat isn't available," which is a 409 as far as
+    the API is concerned. This means "we couldn't even finish checking,"
+    which is a 503 -- the caller should retry, the seat's actual
+    availability is still unknown. Strategy-agnostic and raised here (not
+    in a specific strategy module) so app/api/routes/booking.py can catch
+    it without needing to know which strategy is configured.
+    """
+
+
 class SeatAcquisitionStrategy(Protocol):
     """A way of turning a list of seat ids into HELD seats (or not)."""
 
@@ -52,7 +67,9 @@ def get_strategy(name: str) -> SeatAcquisitionStrategy:
 
         return NaiveStrategy()
     if name == "pessimistic":
-        raise NotImplementedError("Pessimistic locking strategy is Phase 2.")
+        from app.inventory.strategies.pessimistic import PessimisticStrategy
+
+        return PessimisticStrategy()
     if name == "optimistic":
         raise NotImplementedError("Optimistic locking strategy is Phase 3.")
     raise ValueError(f"Unknown strategy: {name!r}")

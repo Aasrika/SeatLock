@@ -4,14 +4,15 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.api.routes import admin, booking
+from app.api.routes import admin, booking, metrics
 from app.infra.config import settings
 from app.infra.db import engine
 from app.infra.redis import get_redis
+from app.inventory.strategies.base import StrategyUnavailable
 
 
 @asynccontextmanager
@@ -40,6 +41,18 @@ app = FastAPI(title="Seatlock", lifespan=lifespan)
 
 app.include_router(booking.router, prefix="/api", tags=["booking"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
+app.include_router(metrics.router, tags=["metrics"])
+
+
+@app.exception_handler(StrategyUnavailable)
+async def _strategy_unavailable_handler(request: Request, exc: StrategyUnavailable) -> JSONResponse:
+    """A strategy hit an infrastructure condition (lock timeout, deadlock)
+    rather than making a business decision about seat availability -- 503,
+    not a generic 500 or a business-level 409. Registered here (strategy-
+    agnostic) rather than in booking.py so the route stays thin and doesn't
+    need to know which strategy is configured.
+    """
+    return JSONResponse(status_code=503, content={"reason": str(exc)})
 
 
 @app.get("/health")
