@@ -1,4 +1,4 @@
-.PHONY: up down logs test lint fmt run-api run-dev benchmark
+.PHONY: up down logs test lint fmt run-api run-dev benchmark benchmark-sweep
 
 UVICORN_WORKERS ?= 4
 PROMETHEUS_MULTIPROC_DIR ?= .prometheus-multiproc
@@ -58,3 +58,9 @@ run-dev:
 
 benchmark:
 	python -m loadtest.run_benchmark
+
+# Phase 3's phase deliverable -- starts and stops the API itself per cell
+# (see loadtest/run_benchmark.py's run_sweep docstring), so `make run-api`
+# must NOT already be running against the same --base-url.
+benchmark-sweep:
+	python -m loadtest.run_benchmark --sweep
