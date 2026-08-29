@@ -108,7 +108,15 @@ class SeatOversell(BaseModel):
 class OversellReportResponse(BaseModel):
     event_id: int
     seats: list[SeatOversell]
-    total_oversell_count: int
+    # Two genuinely different numbers -- collapsing them into one
+    # "total_oversell_count" hid the actual signal (see loadtest/results/
+    # for the investigation): oversold_seats is capped at the number of
+    # seats in contention (1 for a single-seat scenario, however many are
+    # in play for a multi-seat one) and cannot show a distribution by
+    # itself. excess_holders (sum over seats of holders - 1) has no such
+    # ceiling and is what actually varies run to run under a real race.
+    oversold_seats: int
+    excess_holders: int
 
 
 @router.get("/oversell-report", response_model=OversellReportResponse)
@@ -133,8 +141,12 @@ async def get_oversell_report(
         SeatOversell(seat_id=seat_id, distinct_holders=len(holders), holders=sorted(holders))
         for seat_id, holders in sorted(holders_by_seat.items())
     ]
-    total_oversell_count = sum(1 for seat in seats if seat.distinct_holders > 1)
+    oversold_seats = sum(1 for seat in seats if seat.distinct_holders > 1)
+    excess_holders = sum(max(0, seat.distinct_holders - 1) for seat in seats)
 
     return OversellReportResponse(
-        event_id=event_id, seats=seats, total_oversell_count=total_oversell_count
+        event_id=event_id,
+        seats=seats,
+        oversold_seats=oversold_seats,
+        excess_holders=excess_holders,
     )
