@@ -117,12 +117,19 @@ pool_checkout_seconds = Histogram(
 
 deadlocks_total = Counter(
     "deadlocks_total",
-    "Postgres deadlock (40P01) errors encountered while locking seats. "
-    "In pessimistic mode (a) (specific seats, ORDER BY id), a deadlock is "
+    "Postgres deadlock (40P01) errors encountered while locking/updating "
+    "seats. Shared across two strategies with OPPOSITE meanings for the "
+    "same event -- see each strategy module for which applies: "
+    "in pessimistic mode (a) (specific seats, ORDER BY id), a deadlock is "
     "impossible by construction -- this incrementing is a BUG SIGNAL (the "
-    "ordering guarantee broke somehow), not a normal operational event. "
-    "Alert on nonzero, the same way as "
-    "oversell_blocked_total{layer='database'}.",
+    "ordering guarantee broke somehow), not a normal operational event, "
+    "and should alert on nonzero the same way as "
+    "oversell_blocked_total{layer='database'}. In optimistic mode "
+    "(app/inventory/strategies/optimistic.py's multi-row unnest() UPDATE, "
+    "which cannot express ORDER BY the way FOR UPDATE can), a deadlock is "
+    "an expected-but-rare event under multi-seat contention -- it is "
+    "caught and retried, not a bug signal, and should NOT alert on a "
+    "single occurrence the way it would for pessimistic mode (a).",
 )
 
 lock_timeouts_total = Counter(
@@ -189,6 +196,51 @@ def _on_pool_checkout(
 
 
 event.listens_for(engine.sync_engine, "checkout")(_on_pool_checkout)
+
+
+optimistic_conflicts_total = Counter(
+    "optimistic_conflicts_total",
+    "An optimistic acquire attempt's UPDATE matched fewer rows than "
+    "requested -- someone else changed at least one seat's version "
+    "between our read and our write. Incremented once per conflicting "
+    "attempt, including the final attempt of an exhausted acquire() call "
+    "-- see optimistic_retries_total for the (slightly smaller) count of "
+    "conflicts that actually triggered another attempt.",
+)
+
+optimistic_retries_total = Counter(
+    "optimistic_retries_total",
+    "A conflict was followed by an actual retry (attempts remained in "
+    "the budget). Strictly <= optimistic_conflicts_total -- a conflict on "
+    "the LAST allowed attempt increments conflicts but not this, since "
+    "there is no further attempt to make.",
+)
+
+optimistic_exhausted_total = Counter(
+    "optimistic_exhausted_total",
+    "The retry budget (Settings.optimistic_max_attempts) was reached "
+    "without a successful acquire. This is the self-inflicted-DoS guard "
+    "actually firing: a clean domain failure, not an infinite loop and "
+    "not a 500.",
+)
+
+# Buckets are the discrete integer attempt counts themselves (1..10), NOT
+# Prometheus's default time-duration-shaped buckets (.005 .01 .025 ... 5
+# 7.5 10). "Attempts until success" is a small integer, and comparing an
+# integer like 2 or 3 against duration buckets whose first ten boundaries
+# are all < 1.0 would dump nearly every real observation into the last two
+# or three buckets (1.0, 2.5, 5.0) -- destroying exactly the resolution
+# ("did most successes need 1 attempt or 3?") this histogram exists to
+# capture. max_attempts defaults to 5, so 1..10 comfortably covers even a
+# reconfigured, larger retry budget.
+optimistic_attempts = Histogram(
+    "optimistic_attempts",
+    "Number of attempts (reads+UPDATE cycles) an optimistic acquire() "
+    "call needed before it succeeded. Only observed on success -- an "
+    "exhausted call is not 'infinity attempts,' it's optimistic_exhausted"
+    "_total.",
+    buckets=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+)
 
 
 def render_metrics_text() -> bytes:

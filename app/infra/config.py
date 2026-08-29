@@ -50,6 +50,17 @@ class Settings(BaseSettings):
     # indefinitely. See app/inventory/strategies/pessimistic.py.
     pessimistic_lock_timeout_ms: int = 5000
 
+    # Optimistic strategy (Strategy C) retry policy. base is the full-
+    # jitter backoff base (seconds); max_attempts is the retry budget --
+    # unbounded retries under sustained contention are a self-inflicted
+    # DoS. See app/inventory/strategies/optimistic.py.
+    optimistic_backoff_base_seconds: float = 0.05
+    optimistic_max_attempts: int = 5
+    # Ablation switch (SPEC.md section 4 / Phase 3 plan item 5): full
+    # jitter vs. fixed backoff is a MEASURED result, not an asserted one --
+    # this flag is what the loadtest harness flips between the two runs.
+    optimistic_full_jitter: bool = True
+
     # Repo-relative (not an absolute temp path) so the Makefile's run-api
     # target and this process resolve the SAME directory regardless of
     # which shell/OS temp-dir convention is in play -- see
