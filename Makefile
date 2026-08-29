@@ -1,6 +1,7 @@
 .PHONY: up down logs test lint fmt run-api run-dev benchmark
 
 UVICORN_WORKERS ?= 4
+PROMETHEUS_MULTIPROC_DIR ?= .prometheus-multiproc
 
 up:
 	docker compose up -d
@@ -34,12 +35,26 @@ fmt:
 # (config.py): pool_size=10, max_overflow=5, so 4 workers * 15 = 60.
 # Tune POOL_SIZE/MAX_OVERFLOW (env vars, not hardcoded) when diagnosing
 # whether observed latency is lock contention or pool exhaustion.
+# Prometheus multiprocess mode (app/infra/metrics.py) needs its directory
+# cleared exactly once, before any worker starts -- clearing it inside the
+# app itself would race between workers starting up at slightly different
+# times (see that module's docstring). This Makefile target is the one
+# place that happens once, before uvicorn's master process even exists.
 run-api:
-	uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers $(UVICORN_WORKERS)
+	mkdir -p "$(PROMETHEUS_MULTIPROC_DIR)"
+	rm -f "$(PROMETHEUS_MULTIPROC_DIR)"/*.db
+	PROMETHEUS_MULTIPROC_DIR="$(PROMETHEUS_MULTIPROC_DIR)" \
+		uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers $(UVICORN_WORKERS)
 
 # --reload does not work correctly with multiple workers -- always 1 here.
+# Single worker also means multiprocess mode isn't strictly needed, but
+# clearing stale files is harmless and keeps behaviour consistent with
+# run-api.
 run-dev:
-	uvicorn app.main:app --reload --workers 1
+	mkdir -p "$(PROMETHEUS_MULTIPROC_DIR)"
+	rm -f "$(PROMETHEUS_MULTIPROC_DIR)"/*.db
+	PROMETHEUS_MULTIPROC_DIR="$(PROMETHEUS_MULTIPROC_DIR)" \
+		uvicorn app.main:app --reload --workers 1
 
 benchmark:
 	python -m loadtest.run_benchmark

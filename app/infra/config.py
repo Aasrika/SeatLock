@@ -45,5 +45,18 @@ class Settings(BaseSettings):
     pool_size: int = 10
     max_overflow: int = 5
 
+    # How long a blocked SELECT ... FOR UPDATE waits before Postgres gives
+    # up and raises lock_not_available (55P03), rather than hanging
+    # indefinitely. See app/inventory/strategies/pessimistic.py.
+    pessimistic_lock_timeout_ms: int = 5000
+
+    # Repo-relative (not an absolute temp path) so the Makefile's run-api
+    # target and this process resolve the SAME directory regardless of
+    # which shell/OS temp-dir convention is in play -- see
+    # app/infra/metrics.py's module docstring for why this must be cleared
+    # exactly once, before any worker starts (Makefile does that; this
+    # setting is just the shared path both sides agree on).
+    prometheus_multiproc_dir: str = ".prometheus-multiproc"
+
 
 settings = Settings()

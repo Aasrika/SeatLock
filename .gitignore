@@ -9,3 +9,6 @@ __pycache__/
 
 # Generated benchmark output (loadtest/run_benchmark.py) — not source.
 loadtest/results/
+
+# Per-process Prometheus metric files (multiprocess mode) — not source.
+.prometheus-multiproc/
