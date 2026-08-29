@@ -6,3 +6,6 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+
+# Generated benchmark output (loadtest/run_benchmark.py) — not source.
+loadtest/results/

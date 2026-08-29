@@ -1,13 +1,45 @@
 """Seatlock FastAPI application entrypoint."""
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.api.routes import admin, booking
+from app.infra.config import settings
 from app.infra.db import engine
 from app.infra.redis import get_redis
 
-app = FastAPI(title="Seatlock")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Pre-fill the DB connection pool at startup instead of letting it fill
+    lazily on first use.
+
+    Each worker's asyncpg pool otherwise creates connections one at a time,
+    on demand, the first time each is needed -- so a sudden burst of
+    concurrent requests arriving right after startup (a flash sale, or a
+    load test's first tick) pays connection-setup latency on top of the
+    request itself, for every request beyond however many connections
+    happened to already exist. Opening pool_size connections up front, here,
+    means the pool is already warm before the first real request arrives.
+    This was investigated as Experiment 1 for the connection-refused
+    bursts seen in early Phase 1 benchmarking (see loadtest/results/ and
+    the diagnosis recorded there) -- see that writeup for whether it
+    resolved the issue.
+    """
+    conns = await asyncio.gather(*(engine.connect() for _ in range(settings.pool_size)))
+    await asyncio.gather(*(conn.close() for conn in conns))
+    yield
+
+
+app = FastAPI(title="Seatlock", lifespan=lifespan)
+
+app.include_router(booking.router, prefix="/api", tags=["booking"])
+app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 
 
 @app.get("/health")
