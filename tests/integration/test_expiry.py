@@ -49,6 +49,7 @@ from app.infra.metrics import (
 )
 from app.infra.redis import get_redis
 from app.infra.tables import EventRow, SeatRow
+from app.inventory.strategies.optimistic import OptimisticStrategy
 from app.inventory.strategies.pessimistic import PessimisticStrategy
 from workers.reconciler import reconcile_once
 from workers.sweeper import measure_backlog, sweep_once
@@ -206,6 +207,39 @@ class TestLazyExpiryWithoutSweeper:
         assert result.acquired == seat_ids
 
         row = await _get_seat(session_factory, seat_ids[0])
+        assert row.status == "HELD"
+        assert row.held_by_session_id == "new-session"
+
+        await _assert_invariants(session_factory, event_id, 1)
+
+    async def test_expired_unswept_seat_is_reclaimable_via_optimistic_acquire(
+        self, session_factory
+    ):
+        """Regression test for a real bug found running the Phase 4
+        item-7 benchmark re-run: optimistic.py's conditional UPDATE
+        required `status = 'AVAILABLE'` literally, so a seat step (b)'s
+        domain validation correctly accepted as reclaimable-because-
+        expired would still fail this write every time (status was still
+        'HELD' until something else flipped it) -- misread as "someone
+        else changed this row" and retried until the budget exhausted,
+        even with nobody else racing it at all. Confirmed by re-running
+        the recirculating sweep at the production 5s sweeper interval:
+        optimistic's throughput dropped by roughly two-thirds relative to
+        the 100ms-interval benchmark, an effect large enough that a
+        sweeper-interval change alone could not otherwise explain it.
+        """
+        event_id, seat_ids = await _seed_seats(
+            session_factory,
+            [{"status": "HELD", "held_by_session_id": "stale-session", "hold_expires_at": PAST}],
+        )
+        seat_id = seat_ids[0]
+        strategy = OptimisticStrategy()
+
+        async with session_factory() as session:
+            result = await strategy.acquire(session, [seat_id], "new-session", HOLD_DURATION, NOW)
+
+        assert result.success is True, result.reason
+        row = await _get_seat(session_factory, seat_id)
         assert row.status == "HELD"
         assert row.held_by_session_id == "new-session"
 

@@ -14,9 +14,17 @@ Per attempt:
         change the fact that the seat is unavailable right now.
 
     (c) UPDATE seats SET status='HELD', version = version + 1, ...
-         WHERE id = ANY(:ids) AND status='AVAILABLE' AND version = :expected
+         WHERE id = ANY(:ids) AND version = :expected
+           AND (status='AVAILABLE' OR (status='HELD' AND hold_expires_at <= :now))
         -- one conditional UPDATE, per-seat expected version (see "Why
-        unnest(), not one statement per seat" below).
+        unnest(), not one statement per seat" below). The status
+        condition is NOT just `status='AVAILABLE'` (Phase 4 fix -- see
+        "Lazy expiry" below for why): step (b) already validated this
+        exact read as legal, including the case where it's HELD but
+        expired, and the write's status condition must accept everything
+        the validation accepted or every expired-but-unswept hold would
+        be misread as a conflict and endlessly retried instead of simply
+        reclaimed.
 
     (d) If the UPDATE's rowcount is less than the number of seats
         requested: something else changed at least one of those rows
@@ -34,14 +42,33 @@ No lock is ever taken in this strategy. A conflict is detected purely by
 the UPDATE's WHERE clause matching zero rows for a seat whose version no
 longer matches what we read -- there is no separate "check" step distinct
 from the write. This is sound because a single UPDATE statement is atomic
-per row: Postgres either finds a row where `id = X AND status='AVAILABLE'
-AND version = expected` all still hold, in which case it updates that
-exact row and nothing else could have changed it in between (the check and
-the write happen as one indivisible operation against MVCC's current
-snapshot), or it finds no such row, in which case nothing was written and
-nothing needs to be undone for THAT row. There is no window between
-"checked" and "wrote" where another writer could sneak in -- if there were,
-this whole detection mechanism would be unsound, not just imprecise.
+per row: Postgres either finds a row where `id = X AND version = expected
+AND (status='AVAILABLE' OR status='HELD'-but-expired)` all still hold, in
+which case it updates that exact row and nothing else could have changed
+it in between (the check and the write happen as one indivisible
+operation against MVCC's current snapshot), or it finds no such row, in
+which case nothing was written and nothing needs to be undone for THAT
+row. There is no window between "checked" and "wrote" where another
+writer could sneak in -- if there were, this whole detection mechanism
+would be unsound, not just imprecise.
+
+LAZY EXPIRY (Phase 4): a HELD-but-expired row is a legal target for this
+UPDATE, not just for step (b)'s validation -- confirmed as a real bug,
+not a hypothetical one, by re-running the Phase 3 recirculating benchmark
+at the production sweeper interval (5s instead of the benchmark's 100ms):
+optimistic's throughput dropped by roughly two-thirds and its p99 latency
+rose sharply relative to pessimistic, entirely because this WHERE clause
+originally required `status='AVAILABLE'` literally. Every row this
+strategy validates as reclaimable-because-expired would still show
+status='HELD' until SOME writer (the sweeper, or a lucky other request)
+happened to flip it -- so the UPDATE would ALWAYS fail for exactly the
+rows step (b) just said were legal to take, misreading "this hold is
+simply expired" as "someone else changed this row," retrying up to the
+budget, and frequently exhausting it. The version check alone still
+provides the full concurrency guarantee once the status condition is
+widened to match what was actually validated: if anything else touches
+the row between the read and this UPDATE, the version changes and the
+UPDATE correctly fails as a genuine conflict, exactly as before.
 
 Why unnest(), not one statement per seat: SPEC.md's pseudocode uses one
 shared expected version for the whole WHERE ... AND version = :expected --
@@ -163,7 +190,9 @@ _CONDITIONAL_UPDATE_SQL = text(
            updated_at = :now
       FROM unnest(CAST(:ids AS bigint[]), CAST(:expected_versions AS integer[]))
            AS v(id, expected_version)
-     WHERE s.id = v.id AND s.status = 'AVAILABLE' AND s.version = v.expected_version
+     WHERE s.id = v.id
+       AND s.version = v.expected_version
+       AND (s.status = 'AVAILABLE' OR (s.status = 'HELD' AND s.hold_expires_at <= :now))
     """
 )
 
