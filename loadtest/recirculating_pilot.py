@@ -175,8 +175,32 @@ async def poll_available_count_async(
     return samples
 
 
-def _analyze_recirculation(samples: list[AvailableCountSample]) -> dict[str, Any]:
-    if not samples:
+def _analyze_recirculation(
+    samples: list[AvailableCountSample],
+    *,
+    window_start_seconds: float = 0.0,
+    window_end_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Restricts to samples within [window_start_seconds, window_end_seconds)
+    before computing anything -- confirmed necessary by direct observation:
+    the polling loop runs until k6's OS process actually exits
+    (poll_available_count_async's is_done), not until the intended
+    duration elapses. One pilot cell's k6 process lingered to ~48.6s
+    (intended ~18s), with a long idle tail where every seat sat AVAILABLE
+    (nothing left to consume them) -- left unfiltered, that tail alone
+    would have inflated fraction_with_available_seat well above what the
+    actual load window showed. window_end_seconds should be set to
+    warmup_duration_seconds + measured_duration_seconds by the caller;
+    anything beyond that is exactly this kind of post-test idle tail, not
+    signal.
+    """
+    windowed = [
+        s
+        for s in samples
+        if s.elapsed_seconds >= window_start_seconds
+        and (window_end_seconds is None or s.elapsed_seconds < window_end_seconds)
+    ]
+    if not windowed:
         return {
             "recirculation_cycles": None,
             "fraction_with_available_seat": None,
@@ -184,15 +208,15 @@ def _analyze_recirculation(samples: list[AvailableCountSample]) -> dict[str, Any
         }
 
     cycles = 0
-    was_zero = samples[0].available == 0
-    for sample in samples[1:]:
+    was_zero = windowed[0].available == 0
+    for sample in windowed[1:]:
         if was_zero and sample.available > 0:
             cycles += 1
             was_zero = False
         elif sample.available == 0:
             was_zero = True
 
-    available_counts = [s.available for s in samples]
+    available_counts = [s.available for s in windowed]
     fraction_with_available = sum(1 for c in available_counts if c > 0) / len(available_counts)
 
     return {
@@ -202,8 +226,31 @@ def _analyze_recirculation(samples: list[AvailableCountSample]) -> dict[str, Any
             statistics.stdev(available_counts) if len(available_counts) > 1 else 0.0
         ),
         "available_count_mean": statistics.mean(available_counts),
-        "sample_count": len(samples),
+        "sample_count": len(windowed),
+        "raw_sample_count": len(samples),
     }
+
+
+def compute_seat_count_and_vus(ratio: int, base_vus: int, seat_floor: int) -> tuple[int, int]:
+    """Contention ratio = VUs / seats. Normally seat_count is derived from
+    a fixed base_vus; below seat_floor seats, this instead scales VUs UP
+    to preserve the exact target ratio at seat_floor seats.
+
+    Why: below ~10 seats, the inventory pool is too small for a
+    persistently-contested state to exist regardless of hold duration or
+    sweeper interval -- confirmed empirically (ratio 100 at 2 seats stayed
+    at ~20% fraction_available even after tightening both parameters).
+    Shrinking seats further to reach a higher ratio doesn't fix that; it
+    guarantees it. Adding VUs instead keeps enough inventory in play for
+    contention to actually persist, at the cost of needing a client that
+    can sustain more concurrent load -- if THAT hits a ceiling (see the
+    Phase 1 connection-refused investigation), that is a measurement
+    limit to document, not a result to route around.
+    """
+    naive_seat_count = max(1, round(base_vus / ratio))
+    if naive_seat_count >= seat_floor:
+        return naive_seat_count, base_vus
+    return seat_floor, ratio * seat_floor
 
 
 async def run_pilot_cell(
@@ -211,11 +258,13 @@ async def run_pilot_cell(
     k6_bin: str,
     strategy: str,
     ratio: int,
-    vus: int,
+    base_vus: int,
+    seat_floor: int,
     duration: str,
     duration_seconds: float,
     warmup_vus: int,
     warmup_duration: str,
+    warmup_duration_seconds: float,
     hold_duration_seconds: float,
     sweeper_interval_seconds: float,
     sweeper_batch_size: int,
@@ -227,7 +276,7 @@ async def run_pilot_cell(
     prometheus_multiproc_dir: str,
     run_id: str,
 ) -> dict[str, Any]:
-    seat_count = max(1, round(vus / ratio))
+    seat_count, vus = compute_seat_count_and_vus(ratio, base_vus, seat_floor)
 
     api_proc = rb.start_api(
         strategy=strategy,
@@ -272,15 +321,31 @@ async def run_pilot_cell(
         )
         await k6_future  # propagate any exception; confirm full completion
 
-        analysis = _analyze_recirculation(samples)
+        # k6's own summary -- specifically for transport_failures, which
+        # is what tells us whether this ratio's VUs have hit the client-
+        # side ceiling documented in the Phase 1 connection-refused
+        # investigation, as opposed to a genuine measurement.
+        k6_metrics = rb.parse_k6_summary(summary_path)
+
+        # Restrict to the intended measured-phase window
+        # [warmup_duration_seconds, warmup_duration_seconds +
+        # duration_seconds) -- see _analyze_recirculation's docstring for
+        # why the raw sample list can't be trusted as-is.
+        analysis = _analyze_recirculation(
+            samples,
+            window_start_seconds=warmup_duration_seconds,
+            window_end_seconds=warmup_duration_seconds + duration_seconds,
+        )
         return {
             "strategy": strategy,
             "contention_ratio_target": ratio,
             "seat_count": seat_count,
+            "vus": vus,
             "hold_duration_seconds": hold_duration_seconds,
             "sweeper_interval_seconds": sweeper_interval_seconds,
             "sweeper_batch_size": sweeper_batch_size,
             "duration_seconds": duration_seconds,
+            "transport_failures": k6_metrics["transport_failures"],
             **analysis,
             "samples": [asdict(s) for s in samples],
         }
@@ -301,17 +366,20 @@ def render_markdown(results: list[dict[str, Any]]) -> str:
         "Not the sweep -- verifies the workload before running it. See "
         "loadtest/recirculating_pilot.py's module docstring.",
         "",
-        "| Strategy | Ratio | Seats | Hold (s) | Sweeper interval (s) | Cycles observed | "
-        "Fraction with >=1 available | Available count (mean / stdev) | Samples |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| Strategy | Ratio | Seats | VUs | Hold (s) | Sweeper interval (s) | Cycles observed | "
+        "Fraction with >=1 available | Available count (mean / stdev) | Samples "
+        "(windowed/raw) | Transport failures |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         lines.append(
             f"| {r['strategy']} | {r['contention_ratio_target']} | {r['seat_count']} | "
-            f"{r['hold_duration_seconds']} | {r['sweeper_interval_seconds']} | "
-            f"{r['recirculation_cycles']} | {_fmt(r['fraction_with_available_seat'])} | "
+            f"{r.get('vus', '—')} | {r['hold_duration_seconds']} | "
+            f"{r['sweeper_interval_seconds']} | {r['recirculation_cycles']} | "
+            f"{_fmt(r['fraction_with_available_seat'])} | "
             f"{_fmt(r.get('available_count_mean'))} / {_fmt(r['available_count_stdev'])} | "
-            f"{r.get('sample_count', 0)} |"
+            f"{r.get('sample_count', 0)}/{r.get('raw_sample_count', 0)} | "
+            f"{r.get('transport_failures', '—')} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -326,6 +394,7 @@ async def main_async(args: argparse.Namespace) -> None:
         raise SystemExit(f"'{args.k6_bin}' not found on PATH.")
 
     duration_seconds = rb._parse_duration_seconds(args.duration)
+    warmup_duration_seconds = rb._parse_duration_seconds(args.warmup_duration)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-pilot"
 
@@ -337,11 +406,13 @@ async def main_async(args: argparse.Namespace) -> None:
                 k6_bin=k6_bin,
                 strategy=strategy,
                 ratio=ratio,
-                vus=args.vus,
+                base_vus=args.vus,
+                seat_floor=args.seat_floor,
                 duration=args.duration,
                 duration_seconds=duration_seconds,
                 warmup_vus=args.warmup_vus,
                 warmup_duration=args.warmup_duration,
+                warmup_duration_seconds=warmup_duration_seconds,
                 hold_duration_seconds=args.hold_duration_seconds,
                 sweeper_interval_seconds=args.sweeper_interval_seconds,
                 sweeper_batch_size=settings.sweeper_batch_size,
@@ -385,12 +456,29 @@ def main() -> None:
     parser.add_argument(
         "--ratios", default="5,100", help="Two (or more) contention ratios to pilot."
     )
-    parser.add_argument("--vus", type=int, default=200)
+    parser.add_argument(
+        "--vus",
+        type=int,
+        default=200,
+        help="Base VU count. Actual VUs may be scaled up beyond this for a given ratio -- see "
+        "--seat-floor.",
+    )
+    parser.add_argument(
+        "--seat-floor",
+        type=int,
+        default=10,
+        help="Minimum seat count for any cell. Below ~10 seats, inventory can't sustain "
+        "persistent contention regardless of timing -- ratios that would need fewer seats than "
+        "this at --vus instead get MORE VUs, preserving the exact target ratio at this floor.",
+    )
     parser.add_argument("--duration", default="15s")
     parser.add_argument("--warmup-vus", type=int, default=10)
     parser.add_argument("--warmup-duration", default="3s")
-    parser.add_argument("--hold-duration-seconds", type=float, default=2.0)
-    parser.add_argument("--sweeper-interval-seconds", type=float, default=0.2)
+    # Approved parameters (see conversation): hold=1.0s, sweeper=0.1s gave
+    # 84-91% fraction_available at ratio 5, a clear improvement over the
+    # first-guess 2.0s/0.2s (53-59%).
+    parser.add_argument("--hold-duration-seconds", type=float, default=1.0)
+    parser.add_argument("--sweeper-interval-seconds", type=float, default=0.1)
     parser.add_argument(
         "--poll-interval", type=float, default=0.05, help="How often to sample seat-status-counts."
     )

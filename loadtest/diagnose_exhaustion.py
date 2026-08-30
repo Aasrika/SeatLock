@@ -153,10 +153,18 @@ def run_k6_with_raw_json(
         print(f"warning: k6 exited with code {returncode}", file=sys.stderr)
 
 
-def _analyze_raw_json(
-    path: Path, configured_duration_seconds: float
-) -> tuple[float | None, PhaseStats | None, PhaseStats | None]:
-    """Returns (time_to_exhaustion_seconds, contested_stats, exhausted_stats)."""
+def parse_raw_k6_points(
+    path: Path,
+) -> tuple[list[tuple[float, str]], list[tuple[float, float]]]:
+    """Parses k6's raw per-request JSON output (`k6 run --out json=path`)
+    into (status_points, duration_points), each timestamped RELATIVE to
+    the first measured-phase point (t0) -- i.e. relative to when the
+    measured phase itself started, not when k6 (or warmup) started.
+    Shared by this module's exhaustion/phase analysis and
+    loadtest/recirculating_sweep.py's steady-state analysis -- both need
+    the same underlying (timestamp, outcome) stream, just windowed
+    differently.
+    """
     status_points: list[tuple[float, str]] = []  # (relative_time, category)
     duration_points: list[tuple[float, float]] = []  # (relative_time, value_ms)
     raw_times: list[float] = []
@@ -187,11 +195,51 @@ def _analyze_raw_json(
                 duration_points.append((t, data["value"]))
 
     if not raw_times:
-        return None, None, None
+        return [], []
 
     t0 = min(raw_times)
-    status_points = [(t - t0, cat) for t, cat in status_points]
-    duration_points = [(t - t0, v) for t, v in duration_points]
+    return (
+        [(t - t0, cat) for t, cat in status_points],
+        [(t - t0, v) for t, v in duration_points],
+    )
+
+
+def phase_stats_over(
+    status_points: list[tuple[float, str]],
+    duration_points: list[tuple[float, float]],
+    predicate,
+    phase_duration: float,
+) -> PhaseStats:
+    """PhaseStats for whichever points `predicate(relative_time)` selects
+    -- the windowing itself (contested/exhausted here, transient/steady-
+    state in recirculating_sweep.py) is entirely the caller's choice.
+    """
+    counts = dict.fromkeys(_MEASURED_STATUS_METRICS, 0)
+    for t, cat in status_points:
+        if predicate(t):
+            counts[cat] += 1
+    total = sum(counts.values())
+    durations = [v for t, v in duration_points if predicate(t)]
+    return PhaseStats(
+        duration_seconds=phase_duration,
+        successes=counts["status_2xx"],
+        expected_409s=counts["status_409"],
+        unexpected_app_errors=counts["status_other"],
+        transport_failures=counts["status_transport_error"],
+        total_request_rps=(total / phase_duration) if phase_duration > 0 else None,
+        p50_ms=_percentile(durations, 0.50),
+        p95_ms=_percentile(durations, 0.95),
+        p99_ms=_percentile(durations, 0.99),
+    )
+
+
+def _analyze_raw_json(
+    path: Path, configured_duration_seconds: float
+) -> tuple[float | None, PhaseStats | None, PhaseStats | None]:
+    """Returns (time_to_exhaustion_seconds, contested_stats, exhausted_stats)."""
+    status_points, duration_points = parse_raw_k6_points(path)
+    if not status_points and not duration_points:
+        return None, None, None
 
     success_times = [t for t, cat in status_points if cat == "status_2xx"]
     if not success_times:
@@ -206,28 +254,14 @@ def _analyze_raw_json(
     # configured duration, not an observed span, since k6's graceful stop
     # can let a few in-flight iterations finish slightly past the nominal
     # window).
-    def _phase_stats(predicate, phase_duration: float) -> PhaseStats:
-        counts = dict.fromkeys(_MEASURED_STATUS_METRICS, 0)
-        for t, cat in status_points:
-            if predicate(t):
-                counts[cat] += 1
-        total = sum(counts.values())
-        durations = [v for t, v in duration_points if predicate(t)]
-        return PhaseStats(
-            duration_seconds=phase_duration,
-            successes=counts["status_2xx"],
-            expected_409s=counts["status_409"],
-            unexpected_app_errors=counts["status_other"],
-            transport_failures=counts["status_transport_error"],
-            total_request_rps=(total / phase_duration) if phase_duration > 0 else None,
-            p50_ms=_percentile(durations, 0.50),
-            p95_ms=_percentile(durations, 0.95),
-            p99_ms=_percentile(durations, 0.99),
-        )
-
-    contested = _phase_stats(lambda t: t <= exhaustion_time, exhaustion_time)
-    exhausted = _phase_stats(
-        lambda t: t > exhaustion_time, max(0.0, configured_duration_seconds - exhaustion_time)
+    contested = phase_stats_over(
+        status_points, duration_points, lambda t: t <= exhaustion_time, exhaustion_time
+    )
+    exhausted = phase_stats_over(
+        status_points,
+        duration_points,
+        lambda t: t > exhaustion_time,
+        max(0.0, configured_duration_seconds - exhaustion_time),
     )
     return exhaustion_time, contested, exhausted
 

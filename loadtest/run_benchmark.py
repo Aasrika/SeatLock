@@ -397,33 +397,37 @@ def _clear_prometheus_multiproc_dir(path: str) -> None:
     otherwise switching strategies would mix one strategy's lock_wait_
     seconds samples into the next one's scrape.
 
-    Retries each unlink briefly on WinError 32 ("being used by another
-    process") -- encountered directly running the Phase 3 sweep: unlike
-    comparison mode (which restarts the API once per STRATEGY, a handful
-    of times total), the sweep restarts once per CELL, dozens of times in
-    quick succession. stop_api's taskkill /F /T kills the whole process
-    tree and proc.wait() confirms the top-level process has exited, but
+    Retries each unlink on WinError 32 ("being used by another process")
+    -- encountered directly running the Phase 3 sweeps: unlike comparison
+    mode (which restarts the API once per STRATEGY, a handful of times
+    total), the sweeps restart once per CELL, dozens of times in quick
+    succession. stop_api's taskkill /F /T kills the whole process tree
+    and proc.wait() confirms the top-level process has exited, but
     Windows does not guarantee a --workers child's memory-mapped .db file
     handle is released in the same instant the process disappears from
     the process list -- there is a short teardown window where the file
-    still shows as in-use. A few hundred milliseconds of retry absorbs
-    that window; a single strategy/comparison-mode restart never ran
-    into it because there was always much more wall-clock time between
-    successive API starts.
+    still shows as in-use. 2s of retry (10 x 0.2s) was enough for the
+    coarse sweep (one extra process: the API); the recirculating sweep
+    adds a SECOND process sharing this directory (workers/sweeper_worker.py)
+    and hit this same race with that budget exhausted -- confirmed
+    directly, not assumed. 30 x 0.3s (9s) gives real margin without
+    masking a genuinely stuck file (this still raises, loudly, if 9s
+    isn't enough -- it does not retry forever).
     """
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True)
+    max_attempts = 30
     for db_file in p.glob("*.db"):
-        for attempt in range(10):
+        for attempt in range(max_attempts):
             try:
                 db_file.unlink()
                 break
             except FileNotFoundError:
                 break
             except PermissionError:
-                if attempt == 9:
+                if attempt == max_attempts - 1:
                     raise
-                time.sleep(0.2)
+                time.sleep(0.3)
 
 
 def start_api(
