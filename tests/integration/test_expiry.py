@@ -33,8 +33,10 @@ from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from app.api.routes import admin
+from app.api.routes.booking import extend_hold_at
 from app.domain.invariants import check_conservation, check_no_double_booking, check_state_coherence
 from app.infra.mappers import seat_to_domain
+from app.infra.redis import get_redis
 from app.infra.tables import EventRow, SeatRow
 from app.inventory.strategies.pessimistic import PessimisticStrategy
 
@@ -168,3 +170,117 @@ class TestLazyExpiryWithoutSweeper:
         assert counts.booked == 0
 
         await _assert_invariants(session_factory, event_id, 2)
+
+
+class TestExtensionBoundary:
+    """(f): before, exactly at, and after expiry. extend_hold_at takes
+    `now` explicitly (see its docstring) specifically so this boundary
+    can be constructed deterministically instead of racing a real clock.
+    """
+
+    async def test_extend_before_expiry_succeeds(self, session_factory):
+        event_id, seat_ids = await _seed_seats(
+            session_factory,
+            [{"status": "HELD", "held_by_session_id": "s1", "hold_expires_at": FUTURE}],
+        )
+        seat_id = seat_ids[0]
+        new_hold_expires_at = NOW + timedelta(minutes=20)
+
+        async with session_factory() as session:
+            succeeded = await extend_hold_at(session, seat_id, "s1", NOW, new_hold_expires_at)
+
+        assert succeeded is True
+        row = await _get_seat(session_factory, seat_id)
+        assert row.hold_expires_at == new_hold_expires_at
+        assert row.status == "HELD"
+
+        await _assert_invariants(session_factory, event_id, 1)
+
+    async def test_extend_exactly_at_expiry_fails(self, session_factory):
+        """is_hold_expired uses `<=` -- a hold expiring at EXACTLY `now`
+        is already considered expired by the domain layer, so extension
+        must fail here too, not succeed. hold_expires_at == NOW,
+        extend requested at exactly NOW.
+        """
+        event_id, seat_ids = await _seed_seats(
+            session_factory,
+            [{"status": "HELD", "held_by_session_id": "s1", "hold_expires_at": NOW}],
+        )
+        seat_id = seat_ids[0]
+
+        async with session_factory() as session:
+            succeeded = await extend_hold_at(
+                session, seat_id, "s1", NOW, NOW + timedelta(minutes=20)
+            )
+
+        assert succeeded is False
+        row = await _get_seat(session_factory, seat_id)
+        assert row.hold_expires_at == NOW, "a failed extension must not have changed anything"
+
+        await _assert_invariants(session_factory, event_id, 1)
+
+    async def test_extend_after_expiry_fails(self, session_factory):
+        event_id, seat_ids = await _seed_seats(
+            session_factory,
+            [{"status": "HELD", "held_by_session_id": "s1", "hold_expires_at": PAST}],
+        )
+        seat_id = seat_ids[0]
+
+        async with session_factory() as session:
+            succeeded = await extend_hold_at(
+                session, seat_id, "s1", NOW, NOW + timedelta(minutes=20)
+            )
+
+        assert succeeded is False
+        row = await _get_seat(session_factory, seat_id)
+        assert row.hold_expires_at == PAST
+
+        await _assert_invariants(session_factory, event_id, 1)
+
+    async def test_extend_by_a_different_session_fails(self, session_factory):
+        event_id, seat_ids = await _seed_seats(
+            session_factory,
+            [{"status": "HELD", "held_by_session_id": "owner", "hold_expires_at": FUTURE}],
+        )
+        seat_id = seat_ids[0]
+
+        async with session_factory() as session:
+            succeeded = await extend_hold_at(
+                session, seat_id, "someone-else", NOW, NOW + timedelta(minutes=20)
+            )
+
+        assert succeeded is False
+        row = await _get_seat(session_factory, seat_id)
+        assert row.held_by_session_id == "owner"
+
+        await _assert_invariants(session_factory, event_id, 1)
+
+    async def test_extend_refreshes_redis_ttl_to_the_new_expiry_not_the_original_duration(
+        self, session_factory
+    ):
+        """Ruling: TTL must be derived from hold_expires_at, not from
+        Settings.hold_duration_seconds -- after an extension those
+        differ. Uses a new expiry (2 hours out) that is wildly different
+        from the product default hold duration (8 minutes, 480s) so a
+        bug reintroducing duration-based TTL would be unmistakable
+        rather than coincidentally close.
+        """
+        event_id, seat_ids = await _seed_seats(
+            session_factory,
+            [{"status": "HELD", "held_by_session_id": "s1", "hold_expires_at": FUTURE}],
+        )
+        seat_id = seat_ids[0]
+        new_hold_expires_at = NOW + timedelta(hours=2)
+
+        async with session_factory() as session:
+            succeeded = await extend_hold_at(session, seat_id, "s1", NOW, new_hold_expires_at)
+        assert succeeded is True
+
+        ttl = await get_redis().ttl(f"seat:{seat_id}:hold")
+        expected_ttl = (new_hold_expires_at - NOW).total_seconds()
+        assert ttl == pytest.approx(expected_ttl, abs=5), (
+            f"TTL {ttl}s should match the new 2-hour expiry ({expected_ttl:.0f}s), "
+            "not the ~480s product default hold_duration"
+        )
+
+        await _assert_invariants(session_factory, event_id, 1)
