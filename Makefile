@@ -1,4 +1,4 @@
-.PHONY: up down logs test lint fmt run-api run-dev benchmark benchmark-sweep
+.PHONY: up down logs test lint fmt run-api run-dev benchmark benchmark-sweep sweeper reconciler
 
 UVICORN_WORKERS ?= 4
 PROMETHEUS_MULTIPROC_DIR ?= .prometheus-multiproc
@@ -64,3 +64,13 @@ benchmark:
 # must NOT already be running against the same --base-url.
 benchmark-sweep:
 	python -m loadtest.run_benchmark --sweep
+
+# Background jobs (Phase 4, SPEC.md section 5) -- share the same database
+# as `make run-api` but are genuinely separate OS processes (CLAUDE.md
+# rule 1: background jobs within the monolith, not separate services).
+# Run alongside run-api, not instead of it.
+sweeper:
+	python -m workers.sweeper
+
+reconciler:
+	python -m workers.reconciler
