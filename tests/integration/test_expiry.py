@@ -32,6 +32,7 @@ import pytest
 import pytest_asyncio
 from redis.exceptions import RedisError
 from sqlalchemy import insert, select, text
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from app.api.routes import admin
@@ -44,6 +45,7 @@ from app.infra.mappers import seat_to_domain
 from app.infra.metrics import (
     hold_cache_errors_total,
     reconciliation_divergence_total,
+    reconciliation_transient_total,
     sweeper_backlog_gauge,
     sweeper_illegal_transition_total,
 )
@@ -102,6 +104,17 @@ async def _clean_global_state(session_factory):
 
 
 async def _seed_seats(session_factory, seats: list[dict]) -> tuple[int, list[int]]:
+    """updated_at defaults to well before NOW (not left to the column's
+    own server_default=func.now(), i.e. the REAL wall clock) -- this
+    module's fixed NOW constant (2026-06-01) has nothing to do with
+    whatever the actual system clock reads, so leaving updated_at to the
+    server default would make every seeded seat look like it changed
+    seconds ago relative to NOW, permanently defeating (or, depending on
+    which side of NOW the real clock happens to be, never triggering)
+    the reconciler's recent-change grace period for every test unless a
+    test deliberately sets updated_at itself (see TestReconciler's
+    recency tests).
+    """
     async with session_factory() as session:
         event_id = (
             await session.execute(
@@ -126,6 +139,7 @@ async def _seed_seats(session_factory, seats: list[dict]) -> tuple[int, list[int
                     "version": s.get("version", 0),
                     "held_by_session_id": s.get("held_by_session_id"),
                     "hold_expires_at": s.get("hold_expires_at"),
+                    "updated_at": s.get("updated_at", NOW - timedelta(minutes=1)),
                 }
                 for i, s in enumerate(seats)
             ],
@@ -565,7 +579,10 @@ class TestReconciler:
     """(d) second half, (e), and the two ruling additions: each
     divergence kind gets its own dedicated test, plus one pass
     constructing all three at once to prove they're counted distinctly,
-    not collapsed.
+    not collapsed. Also: confirm-on-second-look -- a discrepancy that
+    resolves itself during the confirm delay must be counted transient,
+    never repaired and never counted as a divergence; one that survives
+    the recheck must still be repaired and counted, exactly as before.
     """
 
     async def test_redis_key_missing_for_held_seat_is_repaired(self, session_factory):
@@ -584,7 +601,7 @@ class TestReconciler:
         )
 
         async with session_factory() as session:
-            result = await reconcile_once(session, NOW)
+            result = await reconcile_once(session, NOW, confirm_delay_seconds=0.05)
 
         assert result.redis_key_missing_for_held_seat == 1
         assert result.redis_key_present_for_unheld_seat == 0
@@ -607,7 +624,7 @@ class TestReconciler:
         await get_redis().set(f"seat:{seat_id}:hold", "stale-session", ex=60)
 
         async with session_factory() as session:
-            result = await reconcile_once(session, NOW)
+            result = await reconcile_once(session, NOW, confirm_delay_seconds=0.05)
 
         assert result.redis_key_present_for_unheld_seat == 1
         assert result.redis_key_missing_for_held_seat == 0
@@ -631,7 +648,7 @@ class TestReconciler:
         await get_redis().set(f"seat:{seat_id}:hold", "session-B", ex=60)
 
         async with session_factory() as session:
-            result = await reconcile_once(session, NOW)
+            result = await reconcile_once(session, NOW, confirm_delay_seconds=0.05)
 
         assert result.redis_session_mismatch == 1
         assert result.redis_key_missing_for_held_seat == 0
@@ -655,27 +672,142 @@ class TestReconciler:
         await get_redis().set(f"seat:{unheld_seat}:hold", "stale-session", ex=60)
         await get_redis().set(f"seat:{mismatch_seat}:hold", "session-B", ex=60)
 
-        before = {
-            kind: _counter_value(reconciliation_divergence_total, kind=kind)
-            for kind in (
-                "redis_key_missing_for_held_seat",
-                "redis_key_present_for_unheld_seat",
-                "redis_session_mismatch",
-            )
+        kinds = (
+            "redis_key_missing_for_held_seat",
+            "redis_key_present_for_unheld_seat",
+            "redis_session_mismatch",
+        )
+        divergence_before = {
+            kind: _counter_value(reconciliation_divergence_total, kind=kind) for kind in kinds
+        }
+        transient_before = {
+            kind: _counter_value(reconciliation_transient_total, kind=kind) for kind in kinds
         }
 
         async with session_factory() as session:
-            result = await reconcile_once(session, NOW)
+            result = await reconcile_once(session, NOW, confirm_delay_seconds=0.05)
 
         assert result.redis_key_missing_for_held_seat == 1
         assert result.redis_key_present_for_unheld_seat == 1
         assert result.redis_session_mismatch == 1
-        for kind, before_value in before.items():
-            assert _counter_value(reconciliation_divergence_total, kind=kind) - before_value == 1, (
-                f"{kind} must be incremented exactly once, independently of the other two kinds"
+        assert result.total_transient == 0, "none of these three should have resolved on their own"
+        for kind in kinds:
+            assert (
+                _counter_value(reconciliation_divergence_total, kind=kind) - divergence_before[kind]
+                == 1
+            ), f"{kind} must be incremented exactly once, independently of the other two kinds"
+            # The two counters are never collapsed into one another --
+            # a genuine, persisting divergence must never also bump the
+            # transient counter for the same kind.
+            assert (
+                _counter_value(reconciliation_transient_total, kind=kind) == transient_before[kind]
             )
 
         await _assert_invariants(session_factory, event_id, 3)
+
+    async def test_seat_released_during_confirm_delay_is_counted_transient_not_divergence(
+        self, session_factory
+    ):
+        """Ruling: a seat that changes between the reconciler's initial
+        (non-atomic) observation and its confirm-on-second-look re-read
+        must be counted transient, never as a divergence, and never
+        repaired (there is nothing to repair -- it already resolved
+        itself). Constructed directly: the seat looks like
+        redis_key_missing_for_held_seat on the first read (HELD in
+        Postgres, no mirror key), then is genuinely released in Postgres
+        by a concurrent session WHILE reconcile_once is asleep during its
+        confirm delay -- by the time of the re-read, Postgres no longer
+        says HELD at all, so the original observation was correct at the
+        instant it was taken, but was never a real, actionable divergence.
+        """
+        event_id, seat_ids = await _seed_seats(
+            session_factory,
+            [{"status": "HELD", "held_by_session_id": "s1", "hold_expires_at": FUTURE}],
+        )
+        seat_id = seat_ids[0]
+        # Deliberately no Redis key -- this is what makes it LOOK like
+        # redis_key_missing_for_held_seat on the first, non-atomic read.
+
+        async def release_during_confirm_delay() -> None:
+            # After the initial scan, before the 0.2s confirm delay elapses.
+            await asyncio.sleep(0.05)
+            async with session_factory() as concurrent_session:
+                await concurrent_session.execute(
+                    sa_update(SeatRow)
+                    .where(SeatRow.id == seat_id)
+                    .values(
+                        status="AVAILABLE",
+                        held_by_session_id=None,
+                        hold_expires_at=None,
+                        version=SeatRow.version + 1,
+                    )
+                )
+                await concurrent_session.commit()
+
+        divergence_before = _counter_value(
+            reconciliation_divergence_total, kind="redis_key_missing_for_held_seat"
+        )
+        transient_before = _counter_value(
+            reconciliation_transient_total, kind="redis_key_missing_for_held_seat"
+        )
+
+        release_task = asyncio.create_task(release_during_confirm_delay())
+        async with session_factory() as session:
+            result = await reconcile_once(session, NOW, confirm_delay_seconds=0.2)
+        await release_task
+
+        assert result.redis_key_missing_for_held_seat == 0, (
+            "must NOT be counted/repaired as a divergence -- it resolved on its own"
+        )
+        assert result.transient_redis_key_missing_for_held_seat == 1
+        assert (
+            _counter_value(reconciliation_divergence_total, kind="redis_key_missing_for_held_seat")
+            == divergence_before
+        )
+        assert (
+            _counter_value(reconciliation_transient_total, kind="redis_key_missing_for_held_seat")
+            - transient_before
+            == 1
+        )
+
+        # No repair was made -- there is still no Redis key, correctly,
+        # for a seat that is genuinely AVAILABLE now.
+        assert await get_redis().get(f"seat:{seat_id}:hold") is None
+
+        await _assert_invariants(session_factory, event_id, 1)
+
+    async def test_genuinely_stale_key_persists_across_the_recheck_and_is_repaired(
+        self, session_factory
+    ):
+        """The other side of the same coin: a discrepancy that is STILL
+        there at recheck time (nothing resolves it during the confirm
+        delay) must still be treated as a real divergence -- repaired and
+        counted -- exactly as before confirm-on-second-look existed.
+        """
+        event_id, seat_ids = await _seed_seats(session_factory, [{"status": "AVAILABLE"}])
+        seat_id = seat_ids[0]
+        await get_redis().set(f"seat:{seat_id}:hold", "stale-session", ex=60)
+
+        divergence_before = _counter_value(
+            reconciliation_divergence_total, kind="redis_key_present_for_unheld_seat"
+        )
+        transient_before = _counter_value(
+            reconciliation_transient_total, kind="redis_key_present_for_unheld_seat"
+        )
+
+        async with session_factory() as session:
+            # Nothing changes either store during this delay -- confirms
+            # the divergence is genuine, not a timing artifact.
+            result = await reconcile_once(session, NOW, confirm_delay_seconds=0.2)
+
+        kind = "redis_key_present_for_unheld_seat"
+        assert result.redis_key_present_for_unheld_seat == 1
+        assert result.transient_redis_key_present_for_unheld_seat == 0
+        assert _counter_value(reconciliation_divergence_total, kind=kind) - divergence_before == 1
+        assert _counter_value(reconciliation_transient_total, kind=kind) == transient_before
+        assert await get_redis().get(f"seat:{seat_id}:hold") is None
+
+        await _assert_invariants(session_factory, event_id, 1)
 
     async def test_sweeper_redis_delete_failure_is_repaired_by_reconciler(
         self, session_factory, monkeypatch
@@ -723,7 +855,7 @@ class TestReconciler:
         assert await get_redis().get(f"seat:{seat_id}:hold") == "s1"
 
         async with session_factory() as session:
-            reconcile_result = await reconcile_once(session, NOW)
+            reconcile_result = await reconcile_once(session, NOW, confirm_delay_seconds=0.05)
 
         assert reconcile_result.redis_key_present_for_unheld_seat == 1
         assert await get_redis().get(f"seat:{seat_id}:hold") is None

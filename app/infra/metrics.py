@@ -332,11 +332,12 @@ hold_cache_errors_total = Counter(
 # --- reconciler (workers/reconciler.py) ---------------------------------
 reconciliation_divergence_total = Counter(
     "reconciliation_divergence_total",
-    "Postgres/Redis divergence found and repaired by the reconciler, by "
-    "kind. Postgres always wins -- this counts repairs made TO Redis, "
-    "never the reverse. redis_key_missing_for_held_seat: Postgres says "
-    "HELD, no mirror key exists (e.g. a hold succeeded but its mirror "
-    "write failed -- see hold_cache_errors_total). "
+    "Postgres/Redis divergence CONFIRMED (see reconciliation_transient_"
+    "total for candidates that resolved on their own) and repaired by the "
+    "reconciler, by kind. Postgres always wins -- this counts repairs "
+    "made TO Redis, never the reverse. redis_key_missing_for_held_seat: "
+    "Postgres says HELD, no mirror key exists (e.g. a hold succeeded but "
+    "its mirror write failed -- see hold_cache_errors_total). "
     "redis_key_present_for_unheld_seat: a mirror key exists for a seat "
     "Postgres no longer considers HELD (e.g. the sweeper's Redis delete "
     "failed after its Postgres commit succeeded -- see workers/"
@@ -347,7 +348,27 @@ reconciliation_divergence_total = Counter(
     "a merely stale one; can only arise from a stale key surviving an "
     "expire-and-reacquire cycle. Worth a resume line by itself (SPEC.md "
     "section 5): it says the system assumed its own cache would drift and "
-    "instrumented for it.",
+    "instrumented for it. This is the metric to alert on -- it only "
+    "increments after confirm-on-second-look, so it should not need its "
+    "threshold raised to absorb read-timing noise the way an immediate, "
+    "unconfirmed count would.",
+    ["kind"],
+)
+
+reconciliation_transient_total = Counter(
+    "reconciliation_transient_total",
+    "A discrepancy observed on the reconciler's first, non-atomic read "
+    "across Postgres and Redis, but which had already resolved itself by "
+    "the time of the confirm-on-second-look re-read -- a seat caught "
+    "mid-transition, not real drift. NOT repaired (nothing to repair) and "
+    "NOT counted in reconciliation_divergence_total. Same labels/kinds as "
+    "that counter, tracked separately so the alerting signal stays clean: "
+    "a divergence counter with false positives gets its threshold raised "
+    "until it stops firing, at which point real drift becomes invisible "
+    "too. A high reconciliation_transient_total alongside a low "
+    "reconciliation_divergence_total is a healthy, expected pattern under "
+    "real load, not a problem -- it is confirm-on-second-look doing "
+    "exactly what it is for.",
     ["kind"],
 )
 

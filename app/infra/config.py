@@ -116,5 +116,25 @@ class Settings(BaseSettings):
     # real deployment can widen it.
     reconciler_interval_seconds: float = 60.0
 
+    # Confirm-on-second-look (see workers/reconciler.py's module
+    # docstring for the full reasoning): the reconciler cannot read
+    # Postgres and Redis atomically, so a single observation of a
+    # discrepancy is a CANDIDATE, not a finding -- it may just be a seat
+    # mid-transition. After finding candidates, it waits this long, then
+    # re-reads both stores before deciding to repair-and-count or
+    # dismiss-as-transient. 500ms is enough for an in-flight
+    # request/sweep pass to finish; not so long that a real divergence
+    # sits unrepaired for a meaningfully longer window.
+    reconciler_confirm_delay_seconds: float = 0.5
+
+    # A HELD seat whose updated_at is within this many seconds of "now"
+    # is skipped entirely for this pass -- a row changing right now is
+    # likely a transition in flight, not drift, and will be caught next
+    # pass if it's real. Distinct from reconciler_confirm_delay_seconds:
+    # this filters out candidates before they're even considered: no
+    # log line, no wasted confirm-delay wait, on the class of divergence
+    # most likely to be pure timing noise.
+    reconciler_recent_change_grace_seconds: float = 2.0
+
 
 settings = Settings()
