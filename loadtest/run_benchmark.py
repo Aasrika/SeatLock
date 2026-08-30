@@ -435,6 +435,7 @@ def start_api(
     base_url: str,
     prometheus_multiproc_dir: str,
     optimistic_full_jitter: bool | None = None,
+    hold_duration_seconds: float | None = None,
     health_timeout_seconds: float = 30.0,
 ) -> subprocess.Popen[bytes]:
     """Start uvicorn as a subprocess configured for `strategy`, wait for
@@ -445,6 +446,15 @@ def start_api(
     passed through as an explicit env var override so the jitter ablation
     (run_jitter_ablation) can start two otherwise-identical API instances
     that differ in exactly that one setting.
+
+    hold_duration_seconds overrides Settings.hold_duration_seconds (8
+    minutes in production) -- only ever set by the recirculating-
+    contention benchmark (loadtest/recirculating_pilot.py /
+    recirculating_sweep.py), which needs short holds (~1-2s) so inventory
+    actually cycles within a load-test burst. This is a BENCHMARKING
+    configuration, never a product one -- see those scripts' own
+    docstrings for how the value is chosen (empirically, via a pilot),
+    and docs/benchmarks/phase3-crossover.md for the value actually used.
     """
     _clear_prometheus_multiproc_dir(prometheus_multiproc_dir)
 
@@ -461,6 +471,8 @@ def start_api(
         "MAX_OVERFLOW": str(max_overflow),
         "PROMETHEUS_MULTIPROC_DIR": prometheus_multiproc_dir,
     }
+    if hold_duration_seconds is not None:
+        env["HOLD_DURATION_SECONDS"] = str(hold_duration_seconds)
     if optimistic_full_jitter is not None:
         env["OPTIMISTIC_FULL_JITTER"] = "true" if optimistic_full_jitter else "false"
     cmd = [

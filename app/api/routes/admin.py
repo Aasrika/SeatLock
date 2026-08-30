@@ -1,11 +1,17 @@
-"""GET /api/admin/invariants and GET /api/admin/oversell-report.
+"""GET /api/admin/invariants, GET /api/admin/oversell-report, and
+GET /api/admin/seat-status-counts.
 
 Thin router: the checks themselves are app/domain/invariants.py's pure
 functions; this module's job is only to load the seats/audit rows they
 need and shape the response. /invariants is what the load harness
 (loadtest/run_benchmark.py) polls DURING a run, not just after -- catching
 a violation that self-heals before the run ends is the whole point
-(SPEC.md section 10).
+(SPEC.md section 10). /seat-status-counts exists for the same
+during-a-run-not-just-after reason: the Phase 3 recirculating-contention
+pilot (loadtest/recirculating_pilot.py) polls it throughout a run to
+confirm inventory is actually cycling AVAILABLE -> HELD -> AVAILABLE
+rather than being exhausted once and staying that way -- a real
+observability need, not a benchmark-only shortcut.
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.errors import InvariantViolation
@@ -149,4 +155,44 @@ async def get_oversell_report(
         seats=seats,
         oversold_seats=oversold_seats,
         excess_holders=excess_holders,
+    )
+
+
+class SeatStatusCountsResponse(BaseModel):
+    event_id: int
+    checked_at: datetime
+    available: int
+    held: int
+    booked: int
+
+
+@router.get("/seat-status-counts", response_model=SeatStatusCountsResponse)
+async def get_seat_status_counts(
+    event_id: int, session: Annotated[AsyncSession, Depends(get_session)]
+) -> SeatStatusCountsResponse:
+    """A single cheap GROUP BY -- not check_conservation's full snapshot-
+    and-validate path, which loads every seat row and every domain object
+    just to answer "how many of each status right now." Deliberately
+    unauthenticated/unthrottled like every other /api/admin route in this
+    phase (SPEC.md's admin auth is a later phase) -- fine for a load-test
+    harness polling it every 50-100ms during a run, not fine to expose
+    publicly as-is.
+    """
+    await _get_event_or_404(session, event_id)
+
+    rows = (
+        await session.execute(
+            select(SeatRow.status, func.count())
+            .where(SeatRow.event_id == event_id)
+            .group_by(SeatRow.status)
+        )
+    ).all()
+    counts = {status: count for status, count in rows}
+
+    return SeatStatusCountsResponse(
+        event_id=event_id,
+        checked_at=datetime.now(UTC),
+        available=counts.get("AVAILABLE", 0),
+        held=counts.get("HELD", 0),
+        booked=counts.get("BOOKED", 0),
     )

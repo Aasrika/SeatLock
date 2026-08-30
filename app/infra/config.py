@@ -33,7 +33,12 @@ class Settings(BaseSettings):
     naive_race_window_ms: int = 0
 
     # How long a hold lasts once acquired (SPEC.md section 5: 8 minutes).
-    hold_duration_seconds: int = 480
+    # float, not int: the Phase 3 recirculating-contention benchmark
+    # overrides this to sub-integer values (e.g. 1.5s) so inventory
+    # cycles fast enough to observe within a short load-test burst -- a
+    # benchmarking configuration, never a product one. 480 (8 minutes)
+    # remains the actual product default.
+    hold_duration_seconds: float = 480.0
 
     # Uvicorn worker count for `make run-api` (see Makefile). Each worker
     # is a separate process with its own connection pool, so the real
