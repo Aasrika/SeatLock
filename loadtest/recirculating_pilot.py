@@ -83,9 +83,9 @@ RESULTS_DIR = rb.RESULTS_DIR
 def start_sweeper(
     *, interval_seconds: float, batch_size: int, prometheus_multiproc_dir: str
 ) -> subprocess.Popen[bytes]:
-    """Start workers/sweeper_worker.py as its own OS process. Reuses
-    rb.stop_api to tear it down -- that helper is generic over "a Python
-    subprocess this harness started," not specific to uvicorn.
+    """Start workers/sweeper.py as its own OS process. Reuses rb.stop_api
+    to tear it down -- that helper is generic over "a Python subprocess
+    this harness started," not specific to uvicorn.
     """
     env = {
         **os.environ,
@@ -94,7 +94,7 @@ def start_sweeper(
         "PROMETHEUS_MULTIPROC_DIR": prometheus_multiproc_dir,
     }
     proc = subprocess.Popen(  # noqa: S603
-        [sys.executable, "-m", "workers.sweeper_worker"], env=env
+        [sys.executable, "-m", "workers.sweeper"], env=env
     )
     # No /health endpoint to poll -- the worker's first sweep_once() call
     # happens immediately on startup (see run_forever's while loop), well

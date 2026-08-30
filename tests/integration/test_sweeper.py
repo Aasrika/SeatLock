@@ -20,7 +20,7 @@ from app.domain.invariants import check_conservation, check_no_double_booking, c
 from app.infra.mappers import seat_to_domain
 from app.infra.metrics import sweeper_seats_expired_total
 from app.infra.tables import BookingRow, EventRow, SeatRow
-from app.inventory.sweeper import sweep_once
+from workers.sweeper import sweep_once
 
 NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
 PAST = NOW - timedelta(minutes=10)
@@ -291,8 +291,9 @@ class TestBatchSize:
                 available_count += 1
         assert available_count == 2, "batch_size=2 must expire exactly 2 of the 5 expired seats"
 
-        # A second pass cleans up the remaining backlog -- oldest-expired-
-        # first ordering means this always terminates in ceil(5/2) passes.
+        # A second pass cleans up the remaining backlog -- a deterministic
+        # LIMIT'd order (id, see TestIdOrderWhenBatchIsSmallerThanBacklog)
+        # means this always terminates in ceil(5/2) passes.
         async with session_factory() as session:
             second_pass = await sweep_once(session, batch_size=2, now=NOW)
         async with session_factory() as session:
@@ -303,12 +304,19 @@ class TestBatchSize:
         await _assert_invariants(session_factory, event_id, 5)
 
 
-class TestOldestExpiredFirst:
-    async def test_reclaims_the_longest_expired_seat_first_when_batch_is_smaller_than_backlog(
-        self, session_factory
-    ):
+class TestIdOrderWhenBatchIsSmallerThanBacklog:
+    """Phase 4: the production sweeper orders candidates by id, not by
+    hold_expires_at (Phase 3's benchmark-only sweeper used oldest-expired-
+    first for a stronger I3 guarantee under a persistent backlog; id order
+    is what SPEC.md's production query specifies, and is still a
+    well-defined, deterministic order for LIMIT'd row selection).
+    """
+
+    async def test_reclaims_the_lowest_id_first(self, session_factory):
         older = NOW - timedelta(minutes=20)
         newer = NOW - timedelta(minutes=1)
+        # Inserted in this order, so seat_a gets the lower id -- despite
+        # its hold being the MORE recently expired of the two.
         event_id, seat_ids = await _seed_seats(
             session_factory,
             [
@@ -316,13 +324,13 @@ class TestOldestExpiredFirst:
                 {"status": "HELD", "held_by_session_id": "s-older", "hold_expires_at": older},
             ],
         )
-        newer_seat_id, older_seat_id = seat_ids
+        lower_id_seat, higher_id_seat = seat_ids
 
         async with session_factory() as session:
             result = await sweep_once(session, batch_size=1, now=NOW)
 
         assert result.seats_expired == 1
-        assert (await _get_seat(session_factory, older_seat_id)).status == "AVAILABLE"
-        assert (await _get_seat(session_factory, newer_seat_id)).status == "HELD"
+        assert (await _get_seat(session_factory, lower_id_seat)).status == "AVAILABLE"
+        assert (await _get_seat(session_factory, higher_id_seat)).status == "HELD"
 
         await _assert_invariants(session_factory, event_id, 2)

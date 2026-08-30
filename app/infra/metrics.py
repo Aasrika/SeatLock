@@ -51,6 +51,7 @@ os.environ.setdefault("PROMETHEUS_MULTIPROC_DIR", settings.prometheus_multiproc_
 from prometheus_client import (  # noqa: E402
     CollectorRegistry,
     Counter,
+    Gauge,
     Histogram,
     generate_latest,
     multiprocess,
@@ -242,19 +243,19 @@ optimistic_attempts = Histogram(
     buckets=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
 )
 
-# --- hold sweeper (workers/sweeper_worker.py) --------------------------
+# --- hold sweeper (workers/sweeper.py) ----------------------------------
 #
 # The sweeper is a THIRD writer, alongside whichever booking strategy is
 # under test -- it takes locks (FOR UPDATE SKIP LOCKED) and contends for
 # the same rows. Its own metrics are tracked separately, never folded into
 # a strategy's, so a benchmark run can report what fraction of database
 # work was the sweeper's rather than contention between bookers -- see
-# app/inventory/sweeper.py's module docstring and
+# workers/sweeper.py's module docstring and
 # docs/benchmarks/phase3-crossover.md for why that fraction matters. The
 # sweeper process shares this SAME PROMETHEUS_MULTIPROC_DIR with whichever
 # API instance is running (set via the same env var, see
-# workers/sweeper_worker.py), so these show up in that API's own
-# GET /metrics scrape automatically -- no separate scrape endpoint needed.
+# workers/sweeper.py), so these show up in that API's own GET /metrics
+# scrape automatically -- no separate scrape endpoint needed.
 sweeper_seats_expired_total = Counter(
     "sweeper_seats_expired_total",
     "Seats transitioned HELD -> AVAILABLE by the sweeper because their "
@@ -281,6 +282,73 @@ sweeper_lock_wait_seconds = Histogram(
     "whether observed lock contention came from bookers racing each "
     "other or from the sweeper racing bookers.",
     buckets=_LOCK_TIMING_BUCKETS,
+)
+
+sweeper_illegal_transition_total = Counter(
+    "sweeper_illegal_transition_total",
+    "A sweeper pass's expire() call raised IllegalTransition for a "
+    "candidate row -- e.g. a concurrent booker legitimately reclaimed an "
+    "expired hold (or something else changed its status) between this "
+    "pass's SELECT ... FOR UPDATE SKIP LOCKED and the expire() call a few "
+    "lines later. EXPECTED, not an error: SKIP LOCKED should make this "
+    "rare (the row is locked for the whole window between read and "
+    "write), so this is the safety net catching whatever narrow race "
+    "SKIP LOCKED doesn't cover, not the routine path. Logged at debug,"
+    " counted here, never raised -- one unexpected row must never abort "
+    "an entire batch.",
+)
+
+# multiprocess_mode='mostrecent': there is exactly one sweeper process
+# (unlike uvicorn's --workers N), so "the current value" is unambiguous --
+# whichever process last measured it. 'sum'/'max' would be wrong here (this
+# is a single source of truth, not readings from several workers to
+# combine); 'mostrecent' is the one mode that means "the last observation
+# wins," matching a single periodically-refreshed snapshot gauge exactly.
+sweeper_backlog_gauge = Gauge(
+    "sweeper_backlog",
+    "Count of seats currently HELD with hold_expires_at already passed, "
+    "not yet swept -- i.e. how far behind the sweeper is RIGHT NOW. "
+    "Measured by workers/sweeper.py's measure_backlog(), called at the "
+    "start of every sweep pass AND independently of whether a pass is "
+    "running at all (see that function) -- this is how a stopped or "
+    "overloaded sweeper is detected: this number rises with nothing "
+    "sweeping it back down, rather than only being knowable the next "
+    "time a pass happens to run.",
+    multiprocess_mode="mostrecent",
+)
+
+# --- Redis hold-mirror cache (app/infra/hold_cache.py) ------------------
+hold_cache_errors_total = Counter(
+    "hold_cache_errors_total",
+    "A Redis operation against the hold mirror (set/get/delete) failed --"
+    " connection refused, timeout, or any other RedisError. Never raised "
+    "to the caller (CLAUDE.md rule 4: Redis is a cache, Postgres is the "
+    "source of truth -- a hold must still succeed in Postgres even if its "
+    "mirror write fails); this counter is how that silent degrade-to-"
+    "correct-but-slower is made observable instead of literally silent.",
+    ["operation"],
+)
+
+# --- reconciler (workers/reconciler.py) ---------------------------------
+reconciliation_divergence_total = Counter(
+    "reconciliation_divergence_total",
+    "Postgres/Redis divergence found and repaired by the reconciler, by "
+    "kind. Postgres always wins -- this counts repairs made TO Redis, "
+    "never the reverse. redis_key_missing_for_held_seat: Postgres says "
+    "HELD, no mirror key exists (e.g. a hold succeeded but its mirror "
+    "write failed -- see hold_cache_errors_total). "
+    "redis_key_present_for_unheld_seat: a mirror key exists for a seat "
+    "Postgres no longer considers HELD (e.g. the sweeper's Redis delete "
+    "failed after its Postgres commit succeeded -- see workers/"
+    "sweeper.py's ordering comment). redis_session_mismatch: a mirror key "
+    "exists but names a DIFFERENT session than Postgres's "
+    "held_by_session_id -- the one kind where Redis serves an actively "
+    "WRONG answer (telling the wrong session it holds a seat) rather than "
+    "a merely stale one; can only arise from a stale key surviving an "
+    "expire-and-reacquire cycle. Worth a resume line by itself (SPEC.md "
+    "section 5): it says the system assumed its own cache would drift and "
+    "instrumented for it.",
+    ["kind"],
 )
 
 

@@ -408,7 +408,7 @@ def _clear_prometheus_multiproc_dir(path: str) -> None:
     the process list -- there is a short teardown window where the file
     still shows as in-use. 2s of retry (10 x 0.2s) was enough for the
     coarse sweep (one extra process: the API); the recirculating sweep
-    adds a SECOND process sharing this directory (workers/sweeper_worker.py)
+    adds a SECOND process sharing this directory (workers/sweeper.py)
     and hit this same race with that budget exhausted -- confirmed
     directly, not assumed. 30 x 0.3s (9s) gives real margin without
     masking a genuinely stuck file (this still raises, loudly, if 9s

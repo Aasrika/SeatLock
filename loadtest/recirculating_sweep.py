@@ -10,7 +10,7 @@ spent in post-exhaustion REJECTION cost (cheaper for optimistic, which
 takes no lock, than for pessimistic, which locks, discovers unavailable,
 then releases), not genuine contention. This sweep fixes that by using
 short holds (Settings-overriding HOLD_DURATION_SECONDS) plus
-workers/sweeper_worker.py (Settings-overriding SWEEPER_INTERVAL_SECONDS)
+workers/sweeper.py (Settings-overriding SWEEPER_INTERVAL_SECONDS)
 so inventory recirculates for the WHOLE measured window instead of
 exhausting once.
 

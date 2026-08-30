@@ -74,16 +74,47 @@ class Settings(BaseSettings):
     # setting is just the shared path both sides agree on).
     prometheus_multiproc_dir: str = ".prometheus-multiproc"
 
-    # Hold sweeper (SPEC.md section 5 / I3, workers/sweeper_worker.py).
-    # 5-10s is SPEC.md's own production guidance -- these are PRODUCT
-    # defaults, not benchmarking values. The Phase 3 contention sweep
-    # overrides both via env vars to something much shorter (a
-    # benchmarking configuration, never used here) so inventory
-    # recirculates within a short load-test burst; see
-    # docs/benchmarks/phase3-crossover.md for the actual values used and
-    # how they were chosen (empirically, via a pilot run, not guessed).
+    # Hold sweeper (SPEC.md section 5 / I3, workers/sweeper.py). 5s is
+    # SPEC.md's own production guidance (5-10s) -- these are PRODUCT
+    # defaults. They can be this relaxed, rather than sub-second, BECAUSE
+    # lazy expiry is the actual enforcement mechanism (Phase 4): every
+    # read path that reports or acts on seat availability treats a HELD
+    # row whose hold_expires_at has already passed as available, whether
+    # or not the sweeper has physically gotten to it yet (see
+    # app/inventory/strategies/pessimistic.py's acquire_any_n and
+    # app/api/routes/admin.py's seat-status-counts). The sweeper's job is
+    # only to eventually make the ROW ITSELF agree with what every reader
+    # already treats as true -- cleanup, not the correctness mechanism.
+    # That is what makes a multi-second interval safe here at all: I3
+    # ("no seat stays HELD past hold_expires_at beyond one sweeper
+    # interval") is about the ROW's status column converging, not about
+    # whether the seat is reclaimable in the meantime -- it always is.
+    #
+    # The Phase 3 recirculating-contention benchmark overrides the
+    # interval to 100ms via env var (never by editing this default) for a
+    # reason specific to benchmarking, not production: it needed inventory
+    # to visibly, repeatedly recirculate within a short (10-20s) load-test
+    # burst so contention could be observed for most of the run instead of
+    # once at the start -- a load-test-duration constraint that does not
+    # exist in production, where holds simply expire and get reclaimed
+    # (lazily, or eventually swept) on whatever timescale users actually
+    # act on. See docs/benchmarks/phase3-crossover.md for the values used
+    # and how they were chosen.
     sweeper_interval_seconds: float = 5.0
-    sweeper_batch_size: int = 500
+    # Larger batches hold more row locks simultaneously (FOR UPDATE SKIP
+    # LOCKED on up to this many rows per pass), which can queue bookers
+    # trying to acquire one of those same rows; smaller batches free rows
+    # faster but may not keep up with a large backlog. 100 is a starting
+    # point, not a derived optimum -- tune against observed
+    # sweeper_backlog_gauge in a real deployment.
+    sweeper_batch_size: int = 100
+
+    # How often the reconciler (workers/reconciler.py) compares Redis
+    # hold-mirror keys against Postgres and repairs divergence. Minutes,
+    # not seconds -- SPEC.md section 5: "runs every few minutes." Default
+    # here is more frequent (60s) for faster feedback in development; a
+    # real deployment can widen it.
+    reconciler_interval_seconds: float = 60.0
 
 
 settings = Settings()
