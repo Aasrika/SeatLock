@@ -11,6 +11,7 @@ python -m loadtest.run_benchmark --sweep                    # v1, acquire-only (
 python -m loadtest.diagnose_exhaustion                       # the diagnostic that falsified v1
 python -m loadtest.recirculating_pilot --ratios 2,5,10,20     # parameter selection
 python -m loadtest.recirculating_sweep                        # v2, the sweep this document reports
+python -m loadtest.recirculating_sweep --sweeper-interval-seconds 5.0  # Phase 4 item-7, see Appendix
 ```
 
 ---
@@ -351,3 +352,226 @@ noise at 3 repetitions, at the only ratios where a valid comparison could
 be made at all. Interrogating a clean-looking result before trusting it —
 not the number that result eventually produced — is the actual output of
 this phase.
+
+---
+
+## Appendix — Phase 4 item-7: re-running this sweep at the production sweeper interval
+
+Phase 4 made the sweeper production-grade and moved its default interval
+from this benchmark's 100ms to SPEC.md's actual production guidance,
+5s — safe only because lazy expiry, not sweeper frequency, is supposed to
+be the correctness mechanism (every read/write path independently treats
+a HELD-but-expired row as available; the sweeper just eventually makes the
+row agree). Item 7 of the Phase 4 plan was to re-run this sweep at 5s and
+confirm that claim empirically rather than take it on the strength of the
+audit alone. It did — and, in doing so, found two things the audit missed
+and one thing the sweep itself could no longer validly measure.
+
+### Two lazy-expiry bugs, found two different ways
+
+The Phase 4 audit itself caught one gap directly, by inspection:
+`pessimistic.py`'s `acquire_any_n` filtered candidate seats with
+`SeatRow.status == "AVAILABLE"`, missing the HELD-but-expired case the
+domain layer already treats as reclaimable. Fixed in `7895dc3`, before
+this benchmark ever ran.
+
+Re-running this sweep at 5s surfaced a **second, structurally identical**
+gap the same audit had missed: `optimistic.py`'s conditional UPDATE
+required `status = 'AVAILABLE'` literally, in its raw `text()` SQL. The
+reason the audit caught one and not the other is not that one bug was
+subtler than the other — they are the same bug, in the same shape, in two
+different strategies. It is that **the two rules were expressed in two
+different vocabularies**. The pessimistic fix was found by a search built
+around the ORM's `SeatRow.status ==` construct; the optimistic bug was
+invisible to that search because its own equivalent rule was spelled
+`status = 'AVAILABLE'` inside a string, not a piece of Python syntax any
+AST-or-grep-based tool was looking for. **An audit is only as good as its
+ability to see every place a rule is expressed, and each raw-SQL escape
+hatch removes a construct from every future automated search** — not
+because raw SQL is inherently unsafe, but because it is invisible to
+tooling built around the ORM layer's shapes. Notably, **Phase 3's decision
+to use `unnest()` for the optimistic strategy's per-seat expected-version
+UPDATE — itself the correct call, for the deadlock-avoidance reasons
+documented in that module's docstring — is exactly what put a business
+rule inside raw SQL text in the first place** and is what made this
+particular blind spot possible. Getting one design decision right
+(`unnest()`) created the precondition for a completely unrelated audit
+gap; neither decision was wrong in isolation, and the interaction between
+them is the actual lesson.
+
+### The failure mode
+
+With the fix not yet in place, re-running at the 5s production interval
+(rather than the benchmark's 100ms) made the gap large enough to see:
+`optimistic.py`'s domain validation (step (b), against a freshly-read
+snapshot) correctly said "HELD but expired — reclaimable." Its own write
+(step (c)) then disagreed with that same read, because its WHERE clause
+never accepted the expired-but-still-`HELD` case it had just validated.
+The UPDATE's zero-rows-affected result was indistinguishable, from inside
+the retry loop, from "someone else changed this row" — a genuine
+optimistic-locking conflict — so it retried, using the full backoff
+budget, against a seat nobody else was contending for at all. Throughput
+fell to roughly a third of its 100ms-interval baseline, and p99 latency
+rose sharply, with **no error raised anywhere**: every individual request
+either succeeded or returned an ordinary, well-formed 409. Nothing in the
+system's own error reporting distinguished "genuine contention" from
+"the write and the read it was based on disagree about what counts as
+available." **This is the same silent-wrongness shape as the TOCTOU bug
+this project exists to demonstrate** — not an oversell this time, but the
+same underlying failure: a component acting on a rule that silently
+diverges from the rule everything else believes is in force, with the
+system reporting success/failure at every step and being wrong about what
+those outcomes meant.
+
+### Sweeper database-time share: 16–52% → 1.5–3.6%
+
+Part 5 measured the 100ms-interval benchmark's sweeper consuming
+**16–52%** of each cell's total database time — a substantial fraction of
+what that sweep measured was strategy-vs-sweeper interaction, not
+booker-vs-booker contention (see "Sweeper share of database time" above).
+Re-running at the 5s production interval, sweeper share fell to
+**1.5–3.6%** across every cell
+(`loadtest/results/20260830T091437Z-recirc-summary.md`). This is the
+expected direction and is not itself surprising — a sweeper running 50x
+less often does 50x less work — but the *size* of the drop is the point:
+going from "over half of a run's database time" to "under 4%" without any
+corresponding collapse in how well inventory actually recirculated
+confirms that **lazy expiry, not sweeper frequency, is the dominant
+reclaim path**. The sweeper's physical row updates are cleanup lagging
+behind a mechanism that has already made every expired hold reclaimable
+and reportable-as-available; a production deployment gets to run the
+sweeper rarely specifically because the sweeper was never the thing doing
+the real work.
+
+### The invalid measurement: `fraction_available` under lazy expiry
+
+That same 5s-interval re-run's `fraction_available` metric — the sweep's
+own validity gate, ≥0.6 mean fraction of the window with at least one seat
+AVAILABLE — collapsed to **0.032–0.205 across every cell**, failing the
+threshold everywhere, including at ratio 2, the least contested cell in
+the entire matrix, where the 100ms-interval sweep had measured 1.000. This
+is not evidence that contention got worse, or that recirculation stopped
+happening — pessimistic and optimistic's overlap counts, throughput, and
+p99 all point the other way, back toward parity with each other. The
+cause is `loadtest/recirculating_pilot.py`'s `poll_available_count_async`:
+it counted seats by their raw `status` column, grouped and summed
+directly. **`fraction_available` polls the raw status column, and under
+lazy expiry that column no longer represents availability** — a seat can
+sit at `status = 'HELD'` for up to a full sweeper interval after it
+becomes reclaimable, and at a 5s interval (vs. 100ms) that window is 50x
+wider, relative to the same 1.0s hold duration, than what this metric was
+built and validated against. **The metric did not break — its DEFINITION
+silently stopped matching reality when the mechanism changed.** It kept
+returning well-formed, in-range numbers the entire time; nothing about
+its shape or its call sites signalled that it needed re-examining once
+Phase 4 changed what "available" actually means at the database level.
+
+This is **the second stale-definition failure in this project**, after
+Part 4's `oversold_seats`/`hold_audit`-based oversell detection, which
+kept flagging legitimate sequential recirculation as double-selling after
+the recirculating-workload redesign changed what "held twice" could
+mean. Both failures have the identical shape: a metric whose *definition*
+was correct for the system as it existed when the metric was written, and
+which silently stopped being correct the moment an unrelated, correct
+change was made to the mechanism it was observing — with no test failure,
+no type error, and no exception anywhere to mark the moment it happened.
+**The lesson is the same in both cases: when you change a mechanism,
+audit the metrics that observe it, because metrics have dependencies on
+system behaviour that nothing type-checks.** A metric's correctness is
+coupled to an assumption about the system, and that coupling is invisible
+to every tool that checks whether the code still compiles, still lints,
+still passes its own tests — the metric's *tests*, if it has any, are
+usually written against the same stale assumption that needs revisiting.
+
+Not claimed here: no comparison between pessimistic and optimistic is
+drawn from this run's numbers. The 0.032–0.205 fraction_available figures
+above are cited only as evidence that the measurement was invalid, never
+as a measurement of the system itself.
+
+### Follow-up: fixing the measurement and re-running
+
+`poll_available_count_async` was changed to the same lazy-expiry-aware
+predicate already used by the strategies and by
+`GET /api/admin/seat-status-counts` — `status = 'AVAILABLE' OR (status =
+'HELD' AND hold_expires_at <= now)` — via the same `CASE`-expression
+pattern as `app/api/routes/admin.py`'s `get_seat_status_counts`, and the
+full sweep was re-run at the production 5s interval with the fix in
+place (`loadtest/results/20260830T100647Z-recirc.json`/`-summary.md`).
+
+**Cells now clear the validity threshold.** With the measurement itself
+fixed, mean fraction_available at the 5s production interval is
+comparable to (in most cells, higher than) the original 100ms-interval
+benchmark's own numbers — confirming Part 5's fraction_available
+collapse under the raw-status query was purely a measurement artifact,
+not a real change in recirculation:
+
+| Strategy | Ratio | Seats | VUs | Mean fraction_available (per rep) | Included |
+|---|---|---|---|---|---|
+| naive | 2 | 100 | 200 | 1.000, 1.000, 1.000 | YES |
+| pessimistic | 2 | 100 | 200 | 1.000, 0.996, 1.000 | YES |
+| optimistic | 2 | 100 | 200 | 1.000, 1.000, 1.000 | YES |
+| naive | 5 | 40 | 200 | 0.878, 0.885, 0.833 | YES |
+| pessimistic | 5 | 40 | 200 | 0.893, 0.842, 0.909 | YES |
+| optimistic | 5 | 40 | 200 | 0.972, 0.897, 0.950 | YES |
+| naive | 10 | 20 | 200 | 0.598, 0.749, 0.717 | YES |
+| pessimistic | 10 | 20 | 200 | 0.759, 0.738, 0.862 | YES |
+| optimistic | 10 | 20 | 200 | 0.724, 0.627, 0.450 | **YES (0.601 — barely)** |
+| naive | 20 | 10 | 200 | 0.430 (mean) | NO |
+| pessimistic | 20 | 10 | 200 | 0.441 (mean) | NO |
+| optimistic | 20 | 10 | 200 | 0.385 (mean) | NO |
+
+**Ratio 10 is newly, symmetrically valid** at the production interval —
+unlike the original 100ms sweep (Part 5), where ratio 10 was asymmetric
+(optimistic barely in, pessimistic and naive out), all three strategies
+clear the bar here, giving a third valid ratio to compare that the
+original sweep did not have.
+
+### Steady-state latency and throughput, with variance (3 reps each)
+
+| Strategy | Ratio | p50 (ms) mean/min/max | p95 (ms) mean/min/max | **p99 (ms) mean/min/max** | Throughput (req/s) mean/min/max |
+|---|---|---|---|---|---|
+| naive | 2 | 168.9 / 123.2 / 251.7 | 817.8 / 657.3 / 987.7 | 1269.5 / 943.2 / 1586.6 | 816.7 / 737.6 / 919.5 |
+| pessimistic | 2 | 255.0 / 205.5 / 285.7 | 768.4 / 661.2 / 867.0 | **1172.3 / 1048.4 / 1345.4** | 621.7 / 567.4 / 667.1 |
+| optimistic | 2 | 235.8 / 129.6 / 304.4 | 772.9 / 658.7 / 880.2 | **1175.0 / 1063.3 / 1326.9** | 709.1 / 604.0 / 875.6 |
+| naive | 5 | 237.9 / 203.0 / 259.3 | 638.0 / 600.6 / 670.7 | 944.5 / 911.7 / 982.8 | 689.2 / 608.6 / 748.3 |
+| pessimistic | 5 | 269.0 / 176.5 / 331.6 | 772.1 / 683.1 / 822.5 | **1172.7 / 1122.2 / 1214.7** | 652.3 / 564.1 / 787.7 |
+| optimistic | 5 | 199.6 / 160.8 / 224.1 | 878.0 / 569.0 / 1417.0 | **1329.7 / 822.6 / 2198.8** | 658.3 / 603.4 / 759.7 |
+| naive | 10 | 246.0 / 186.8 / 294.5 | 721.8 / 645.1 / 763.8 | 1080.8 / 985.1 / 1172.0 | 716.6 / 654.9 / 838.2 |
+| pessimistic | 10 | 308.4 / 286.7 / 326.2 | 774.5 / 731.5 / 812.5 | **1108.3 / 1027.8 / 1196.4** | 550.2 / 469.4 / 591.8 |
+| optimistic | 10 | 215.8 / 145.3 / 265.9 | 685.8 / 669.4 / 709.1 | **1140.4 / 1020.3 / 1311.5** | 752.8 / 674.8 / 880.1 |
+
+**Ratios 2 and 5 reproduce Part 5's finding exactly: no measurable
+difference survives the overlap check.** At ratio 2, optimistic's p99
+range (1063.3–1326.9) sits entirely inside pessimistic's (1048.4–1345.4);
+throughput ranges overlap substantially (pessimistic 567.4–667.1,
+optimistic 604.0–875.6). At ratio 5, pessimistic's p99 range
+(1122.2–1214.7) sits entirely inside optimistic's much wider one
+(822.6–2198.8, one rep's tail alone reaching 2198.8ms); throughput ranges
+again overlap (pessimistic 564.1–787.7, optimistic 603.4–759.7).
+
+**Ratio 10 — the newly-valid comparison — behaves differently.** p99
+ranges still overlap (pessimistic 1027.8–1196.4 sits entirely inside
+optimistic's 1020.3–1311.5), but **throughput ranges do not**:
+pessimistic's 3 reps (469.4–591.8 req/s) sit entirely below optimistic's
+3 reps (674.8–880.1 req/s) — the first non-overlapping throughput result
+at any ratio in either version of this sweep. This is reported, not
+claimed as a finding: it is 3 reps, at a ratio where optimistic's own
+fraction_available (0.601) sits right at the validity boundary, with no
+independent replication yet. It is the kind of result that would justify
+a dedicated follow-up (more reps, specifically at ratio 10) before being
+treated as evidence of a real mechanism — not evidence on its own that
+one exists.
+
+Oversold/overlap counts remain the same useful cross-check as Part 4:
+zero for pessimistic and optimistic at every ratio in this table, nonzero
+and ratio-scaling for naive (19–113 oversold seats, 102–398 overlap
+events) — the detection mechanism still finds real oversell when it's
+actually present, at the production sweeper interval as much as at the
+benchmark one.
+
+**This does not change the document's Conclusion.** It extends the valid
+range by one ratio (10, now symmetric) beyond what the original 100ms
+sweep could support, and confirms that ratio 10's asymmetry there was a
+property of the 100ms configuration's own noise, not of the underlying
+system. Ratios 2–10 still show no crossover; ratio 10's throughput gap is
+flagged for further investigation, not folded into that conclusion.
