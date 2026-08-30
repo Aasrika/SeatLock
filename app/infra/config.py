@@ -69,5 +69,16 @@ class Settings(BaseSettings):
     # setting is just the shared path both sides agree on).
     prometheus_multiproc_dir: str = ".prometheus-multiproc"
 
+    # Hold sweeper (SPEC.md section 5 / I3, workers/sweeper_worker.py).
+    # 5-10s is SPEC.md's own production guidance -- these are PRODUCT
+    # defaults, not benchmarking values. The Phase 3 contention sweep
+    # overrides both via env vars to something much shorter (a
+    # benchmarking configuration, never used here) so inventory
+    # recirculates within a short load-test burst; see
+    # docs/benchmarks/phase3-crossover.md for the actual values used and
+    # how they were chosen (empirically, via a pilot run, not guessed).
+    sweeper_interval_seconds: float = 5.0
+    sweeper_batch_size: int = 500
+
 
 settings = Settings()

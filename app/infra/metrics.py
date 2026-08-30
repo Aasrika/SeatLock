@@ -242,6 +242,47 @@ optimistic_attempts = Histogram(
     buckets=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
 )
 
+# --- hold sweeper (workers/sweeper_worker.py) --------------------------
+#
+# The sweeper is a THIRD writer, alongside whichever booking strategy is
+# under test -- it takes locks (FOR UPDATE SKIP LOCKED) and contends for
+# the same rows. Its own metrics are tracked separately, never folded into
+# a strategy's, so a benchmark run can report what fraction of database
+# work was the sweeper's rather than contention between bookers -- see
+# app/inventory/sweeper.py's module docstring and
+# docs/benchmarks/phase3-crossover.md for why that fraction matters. The
+# sweeper process shares this SAME PROMETHEUS_MULTIPROC_DIR with whichever
+# API instance is running (set via the same env var, see
+# workers/sweeper_worker.py), so these show up in that API's own
+# GET /metrics scrape automatically -- no separate scrape endpoint needed.
+sweeper_seats_expired_total = Counter(
+    "sweeper_seats_expired_total",
+    "Seats transitioned HELD -> AVAILABLE by the sweeper because their "
+    "hold had expired. Summed across every batch, every pass.",
+)
+
+sweeper_batch_duration_seconds = Histogram(
+    "sweeper_batch_duration_seconds",
+    "Wall-clock time for one whole sweeper pass (the SELECT ... FOR "
+    "UPDATE SKIP LOCKED through COMMIT/ROLLBACK), regardless of how many "
+    "seats it found. Its sum, as a fraction of a benchmark run's "
+    "duration, is what 'sweeper share of DB time' means here -- an upper "
+    "bound on how much of the run the sweeper was actively doing work, "
+    "not a literal accounting of Postgres-side CPU time.",
+    buckets=_LOCK_TIMING_BUCKETS,
+)
+
+sweeper_lock_wait_seconds = Histogram(
+    "sweeper_lock_wait_seconds",
+    "Time from issuing the sweeper's SELECT ... FOR UPDATE SKIP LOCKED "
+    "to getting rows back. Deliberately a SEPARATE metric from "
+    "lock_wait_seconds (pessimistic strategy's per-acquisition lock "
+    "wait) -- conflating the two would make it impossible to tell "
+    "whether observed lock contention came from bookers racing each "
+    "other or from the sweeper racing bookers.",
+    buckets=_LOCK_TIMING_BUCKETS,
+)
+
 
 def render_metrics_text() -> bytes:
     """Aggregate every worker's per-process metric files into one
