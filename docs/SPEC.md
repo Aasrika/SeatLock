@@ -213,9 +213,9 @@ Two-phase booking: **hold** (free, instant, TTL-bounded) then **confirm** (payme
 Redis can restart, evict keys under memory pressure, or fail over and lose recent writes. If your expiry logic depends solely on a Redis key vanishing, seats leak into permanent `HELD` limbo — invariant I3 broken, and your event silently sells 200 fewer tickets than it has.
 
 So:
-- Every read path filters with `AND (status != 'HELD' OR hold_expires_at < now())`
+- Every read path filters with `AND (status != 'HELD' OR hold_expires_at <= now())` (`<=`, not `<` — this must match `is_hold_expired`'s own comparison in `app/domain/state_machine.py` exactly, or there is a one-instant window where the domain layer considers a hold expired and the query layer disagrees; see CLAUDE.md's Deviations section)
 - Redis holds a mirrored key with TTL purely to serve fast availability reads and drive WebSocket expiry notifications
-- A **sweeper worker** runs every 5–10 seconds: `UPDATE seats SET status='AVAILABLE', held_by_session_id=NULL, hold_expires_at=NULL WHERE status='HELD' AND hold_expires_at < now()` — batched, with `SKIP LOCKED`, and it publishes release events
+- A **sweeper worker** runs every 5–10 seconds: `UPDATE seats SET status='AVAILABLE', held_by_session_id=NULL, hold_expires_at=NULL WHERE status='HELD' AND hold_expires_at <= now()` — batched, with `SKIP LOCKED`, and it publishes release events
 - A **reconciler** runs every few minutes and repairs Redis/Postgres divergence, logging every discrepancy it finds as a counter
 
 **The counter `reconciliation_divergence_total` is worth a resume line by itself.** It says you assumed your own cache would drift and instrumented for it.

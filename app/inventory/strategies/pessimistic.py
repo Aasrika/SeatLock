@@ -83,7 +83,7 @@ import time
 from datetime import datetime, timedelta
 from typing import NoReturn
 
-from sqlalchemy import select, text
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -171,6 +171,24 @@ class PessimisticStrategy:
         isn't exposed through POST /api/holds (which only ever knows
         specific seat_ids). Used directly by callers who want exactly
         this semantics, and by tests/integration/test_pessimistic.py.
+
+        WHERE matches AVAILABLE seats *and* HELD-but-expired ones (Phase
+        4 fix -- see this method's git history for the bug this
+        replaced): a status filter written in SQL is itself a business
+        rule about which seats can be acquired, and it must agree with
+        the domain layer's own rule (state_machine.hold() already treats
+        an expired HELD seat as reclaimable) or CLAUDE.md rule 3 is
+        broken by a WHERE clause instead of a status assignment -- a
+        quieter way to violate it than writing to seat.status directly,
+        but a violation all the same. Before this fix, mode (b) could
+        NEVER reclaim an expired hold itself; it depended entirely on
+        the sweeper having already flipped the row to AVAILABLE. With a
+        sweeper interval of seconds rather than milliseconds (Phase 4:
+        lazy expiry at the query layer is the mechanism, the sweeper is
+        cleanup), that gap meant every expired-but-unswept seat was
+        wrongly unbookable for up to a full sweeper interval -- under
+        flash-sale-scale load, thousands of false "insufficient
+        availability" rejections against seats nobody actually holds.
         """
         await self._set_lock_timeout(session)
 
@@ -178,7 +196,13 @@ class PessimisticStrategy:
         try:
             result = await session.execute(
                 select(SeatRow)
-                .where(SeatRow.event_id == event_id, SeatRow.status == "AVAILABLE")
+                .where(
+                    SeatRow.event_id == event_id,
+                    or_(
+                        SeatRow.status == "AVAILABLE",
+                        and_(SeatRow.status == "HELD", SeatRow.hold_expires_at <= now),
+                    ),
+                )
                 .order_by(SeatRow.id)
                 .limit(count)
                 .with_for_update(skip_locked=True)

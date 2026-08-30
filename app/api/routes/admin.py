@@ -22,7 +22,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.errors import InvariantViolation
@@ -177,14 +177,27 @@ async def get_seat_status_counts(
     phase (SPEC.md's admin auth is a later phase) -- fine for a load-test
     harness polling it every 50-100ms during a run, not fine to expose
     publicly as-is.
+
+    Lazy-expiry aware (Phase 4): a HELD row whose hold_expires_at has
+    already passed is counted as AVAILABLE, not HELD -- this endpoint's
+    whole purpose is reporting seat *availability*, and reporting a
+    reclaimable seat as unavailable would be exactly the query-layer/
+    domain-layer disagreement Phase 4's audit exists to close (see
+    app/inventory/strategies/pessimistic.py's acquire_any_n for the same
+    fix applied to an acquisition path instead of a report).
     """
     await _get_event_or_404(session, event_id)
+    now = datetime.now(UTC)
 
+    effective_status = case(
+        (and_(SeatRow.status == "HELD", SeatRow.hold_expires_at <= now), "AVAILABLE"),
+        else_=SeatRow.status,
+    )
     rows = (
         await session.execute(
-            select(SeatRow.status, func.count())
+            select(effective_status, func.count())
             .where(SeatRow.event_id == event_id)
-            .group_by(SeatRow.status)
+            .group_by(effective_status)
         )
     ).all()
     counts = {status: count for status, count in rows}

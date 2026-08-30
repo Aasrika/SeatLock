@@ -44,3 +44,8 @@ Full spec: docs/SPEC.md — read the relevant section before implementing.
 - SPEC.md section 2 originally named this package `app/platform/`. It is
   `app/infra/` instead — `platform` shadows a Python stdlib module. SPEC.md
   has been updated to match; this note is the record of why.
+- SPEC.md section 5 originally wrote the expiry filter as
+  `hold_expires_at < now()`. It is `<=` instead, matching
+  `app/domain/state_machine.py`'s `is_hold_expired` exactly — `<` would leave
+  a one-instant window where the domain layer considers a hold expired and
+  the query layer does not agree. SPEC.md has been updated to match.
