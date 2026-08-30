@@ -51,6 +51,7 @@ from app.infra.metrics import (
 )
 from app.infra.redis import get_redis
 from app.infra.tables import EventRow, SeatRow
+from app.inventory.strategies.naive import NaiveStrategy
 from app.inventory.strategies.optimistic import OptimisticStrategy
 from app.inventory.strategies.pessimistic import PessimisticStrategy
 from workers.reconciler import reconcile_once
@@ -280,6 +281,58 @@ class TestLazyExpiryWithoutSweeper:
         assert counts.booked == 0
 
         await _assert_invariants(session_factory, event_id, 2)
+
+
+class TestLazyExpiryAcrossStrategies:
+    """Direct regression test for the bug class found in Phase 4's item-7
+    benchmark re-run (see docs/benchmarks/phase3-crossover.md's appendix):
+    pessimistic.py's acquire_any_n and optimistic.py's conditional UPDATE
+    each independently failed to treat an expired-but-unswept HELD row as
+    reclaimable, because each expressed its own availability rule in its
+    own SQL, and one of those two expressions -- optimistic's, written as
+    raw text() SQL -- was invisible to the ORM-pattern-based (SeatRow.status
+    ==) search that caught the other. A search can only ever be as good as
+    its ability to see every place a rule is expressed. Asserting the
+    invariant directly against every strategy's OWN acquire(), rather than
+    searching source for the right pattern, is what catches the next
+    instance regardless of what syntax it happens to be written in --
+    parametrizing over SeatAcquisitionStrategy instances means a fourth
+    strategy is covered automatically the moment it's added to the list
+    below.
+    """
+
+    @pytest.mark.parametrize(
+        "strategy",
+        [NaiveStrategy(), PessimisticStrategy(), OptimisticStrategy()],
+        ids=["naive", "pessimistic", "optimistic"],
+    )
+    async def test_expired_unswept_hold_is_reclaimable_by_a_different_session(
+        self, session_factory, strategy
+    ):
+        event_id, seat_ids = await _seed_seats(
+            session_factory,
+            [{"status": "HELD", "held_by_session_id": "stale-session", "hold_expires_at": PAST}],
+        )
+        seat_id = seat_ids[0]
+
+        # The sweeper has NOT run -- the row is still physically HELD.
+        # Whatever reclaims it here can only be each strategy's own
+        # acquire() treating hold_expires_at <= now as available, not
+        # cleanup having already happened underneath it.
+        async with session_factory() as session:
+            result = await strategy.acquire(session, [seat_id], "new-session", HOLD_DURATION, NOW)
+
+        assert result.success is True, (
+            f"{type(strategy).__name__} failed to reclaim an expired-but-"
+            f"unswept hold: {result.reason}"
+        )
+        assert result.acquired == [seat_id]
+
+        row = await _get_seat(session_factory, seat_id)
+        assert row.status == "HELD"
+        assert row.held_by_session_id == "new-session"
+
+        await _assert_invariants(session_factory, event_id, 1)
 
 
 class TestExtensionBoundary:

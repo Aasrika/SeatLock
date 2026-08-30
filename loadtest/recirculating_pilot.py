@@ -70,7 +70,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.infra.config import settings
@@ -150,16 +150,37 @@ async def poll_available_count_async(
 ) -> list[AvailableCountSample]:
     """See module docstring for why this queries the database directly
     rather than the admin HTTP endpoint.
+
+    Lazy-expiry aware (Phase 4 item-7 re-run fix): a HELD row whose
+    hold_expires_at has already passed is counted as AVAILABLE, not HELD --
+    same effective_status CASE expression as
+    app/api/routes/admin.py's get_seat_status_counts and the same predicate
+    the strategies themselves now use to decide reclaimability (see
+    app/inventory/strategies/pessimistic.py's acquire_any_n). Before this
+    fix, this poll counted the raw status column: under lazy expiry that
+    column stops representing availability the moment a hold outlives its
+    hold_expires_at but the sweeper hasn't reached it yet, so every cell's
+    fraction_available was measuring "has the sweeper visited this row,"
+    not "was a seat obtainable" -- a metric whose DEFINITION silently
+    stopped matching what it was built to observe when the underlying
+    mechanism changed out from under it, not a bug in the polling
+    mechanics themselves. See docs/benchmarks/phase3-crossover.md's
+    appendix for the full finding.
     """
     samples: list[AvailableCountSample] = []
     start = time.monotonic()
     while not is_done():
+        now = datetime.now(UTC)
+        effective_status = case(
+            (and_(SeatRow.status == "HELD", SeatRow.hold_expires_at <= now), "AVAILABLE"),
+            else_=SeatRow.status,
+        )
         async with session_factory() as session:
             rows = (
                 await session.execute(
-                    select(SeatRow.status, func.count())
+                    select(effective_status, func.count())
                     .where(SeatRow.event_id == event_id)
-                    .group_by(SeatRow.status)
+                    .group_by(effective_status)
                 )
             ).all()
         counts = dict(rows)
