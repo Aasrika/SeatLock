@@ -1,0 +1,59 @@
+:root {
+  color-scheme: light;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  padding: 24px;
+}
+
+.app-nav {
+  margin-bottom: 16px;
+}
+
+.app-nav button {
+  margin-right: 8px;
+}
+
+.connection-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9em;
+}
+
+.connection-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.checkout-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 0;
+  padding: 8px 12px;
+  background: #f4f4f4;
+  border-radius: 6px;
+}
+
+.message {
+  color: #c0392b;
+  font-weight: 600;
+}
+
+.invariant-ok {
+  color: #2ecc71;
+}
+
+.invariant-fail {
+  color: #e74c3c;
+  font-weight: 600;
+}
+
+svg[role="img"] rect {
+  transition: fill 0.15s ease-in-out;
+}

@@ -77,9 +77,26 @@ interval) benchmark this superseded: [docs/benchmarks/phase3-crossover.md](docs/
 
 ## Demo
 
-> **TODO (Phase 7):** GIF here — two browser windows on the same event,
-> one seat, live seat-map update showing the hold/expiry/confirm cycle
-> propagate to both in real time.
+![Two browser windows viewing the same event; the left window holds a seat and checks out while the right window sees it turn HELD live over the WebSocket.](docs/demo.gif)
+
+Two browser windows, same event, same seat map. The left window clicks
+a seat (optimistic hold, then the real hold/checkout flow); the right
+window — which never touched that seat — sees it turn from AVAILABLE
+to HELD within the coalescing window, pushed over `/ws/events/{id}`
+with no manual refresh.
+
+Reproduce it yourself:
+
+```bash
+make up && alembic upgrade head && make run-api   # backend
+npm run dev --prefix web                           # frontend, port 5173
+DEMO_EVENT_ID=$(python -m scripts.seed_demo_event 2>/dev/null) \
+  node web/demo/two-browsers.mjs
+```
+
+See [web/demo/two-browsers.mjs](web/demo/two-browsers.mjs) for the
+Playwright script and the exact `ffmpeg` commands used to turn its two
+recordings into the GIF above.
 
 ---
 
