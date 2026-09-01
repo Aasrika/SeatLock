@@ -486,6 +486,54 @@ late_payment_refund_required_total = Counter(
     "payment processing time.",
 )
 
+# --- realtime seat map (SPEC.md section 9, app/realtime/) ---------------
+#
+# multiprocess_mode="livesum": with 4 uvicorn workers, each worker holds
+# some subset of all open WebSocket connections -- unlike
+# sweeper_backlog_gauge (one process is ever the source of truth) this is
+# genuinely N independent live counts that should be SUMMED for the
+# fleet-wide total, and "livesum" is specifically "sum across processes
+# that are still alive" (a worker that crashed shouldn't keep
+# contributing a stale count forever, which plain "sum" would allow).
+ws_connections_gauge = Gauge(
+    "ws_connections",
+    "Currently open WebSocket connections, summed across all live "
+    "uvicorn workers.",
+    multiprocess_mode="livesum",
+)
+
+ws_messages_sent_total = Counter(
+    "ws_messages_sent_total",
+    "One increment per actual WebSocket send() call -- i.e. per "
+    "connected client that received a given section's coalesced diff, "
+    "not per underlying seat change. This is the number the coalescing "
+    "buffer exists to keep independent of how many raw seat-change "
+    "events occurred, not independent of how many clients are "
+    "connected (see ws_events_coalesced_total for the other half of "
+    "that story).",
+)
+
+ws_events_coalesced_total = Counter(
+    "ws_events_coalesced_total",
+    "Raw seat-change events absorbed into a combined broadcast (or into "
+    "no broadcast at all, when a seat's net state across the window was "
+    "unchanged) rather than sent as their own message. A high rate here "
+    "relative to ws_messages_sent_total is the coalescing buffer doing "
+    "its job -- see app/realtime/coalescer.py's module docstring for "
+    "why this is the main scaling mechanism, not an optimisation on top "
+    "of one.",
+)
+
+ws_broadcast_duration_seconds = Histogram(
+    "ws_broadcast_duration_seconds",
+    "Time to serialize one section's coalesced diff and send it to "
+    "every locally-connected subscriber of that section, once per "
+    "coalescing window per section (not per client) -- this is exactly "
+    "the cost coalescing makes O(clients) per tick instead of "
+    "O(events x clients).",
+    buckets=_LOCK_TIMING_BUCKETS,
+)
+
 
 def render_metrics_text() -> bytes:
     """Aggregate every worker's per-process metric files into one

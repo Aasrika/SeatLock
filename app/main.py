@@ -8,11 +8,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.api.routes import admin, booking, bookings, metrics, webhooks
+from app.api.routes import admin, booking, bookings, metrics, webhooks, ws
 from app.infra.config import settings
-from app.infra.db import engine
+from app.infra.db import async_session_factory, engine
 from app.infra.redis import get_redis
 from app.inventory.strategies.base import StrategyUnavailable
+from app.realtime.hub import init_hub
 
 
 @asynccontextmanager
@@ -34,7 +35,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     conns = await asyncio.gather(*(engine.connect() for _ in range(settings.pool_size)))
     await asyncio.gather(*(conn.close() for conn in conns))
-    yield
+
+    # One RealtimeHub per worker process (Phase 7, SPEC.md section 9) --
+    # see app/realtime/hub.py's own docstring for why this is per-process,
+    # not a cross-worker singleton.
+    hub = init_hub(get_redis(), async_session_factory)
+    await hub.start()
+    try:
+        yield
+    finally:
+        await hub.stop()
 
 
 app = FastAPI(title="Seatlock", lifespan=lifespan)
@@ -44,6 +54,7 @@ app.include_router(bookings.router, prefix="/api", tags=["bookings"])
 app.include_router(webhooks.router, prefix="/api", tags=["webhooks"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(metrics.router, tags=["metrics"])
+app.include_router(ws.router, tags=["realtime"])
 
 
 @app.exception_handler(StrategyUnavailable)

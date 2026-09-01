@@ -185,5 +185,18 @@ class Settings(BaseSettings):
     payment_worker_interval_seconds: float = 5.0
     payment_worker_batch_size: int = 100
 
+    # --- Phase 7: realtime seat map (SPEC.md section 9) ----------------
+    #
+    # The coalescing window (app/realtime/coalescer.py): raw seat-change
+    # events for one (event, section) accumulate here, and one combined
+    # diff is broadcast per window instead of one message per event. This
+    # is the mechanism that keeps broadcast cost O(clients) per tick
+    # rather than O(events x clients) -- see that module's own docstring.
+    # 100ms is short enough that a hold/release still feels instant to a
+    # human, long enough to actually absorb a burst (a flash-sale-style
+    # run of holds/releases on the same seats within one tick) into a
+    # single serialize-and-send per section.
+    ws_coalesce_window_ms: float = 100.0
+
 
 settings = Settings()
