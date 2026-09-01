@@ -40,12 +40,14 @@ from app.api.routes.bookings import (
     confirm_booking_route,
     create_booking_route,
 )
+from app.booking.confirm import attempt_confirm_write
 from app.booking.create import CreateBookingParams, create_booking
 from app.booking.responses import BookingResponse
 from app.domain.invariants import check_conservation, check_no_double_booking, check_state_coherence
 from app.infra import idempotency
 from app.infra.mappers import seat_to_domain
-from app.infra.tables import BookingRow, EventRow, IdempotencyKeyRow, SeatRow
+from app.infra.metrics import oversell_blocked_total
+from app.infra.tables import BookingRow, BookingSeatRow, EventRow, IdempotencyKeyRow, SeatRow
 from workers.idempotency_reaper import reap_once
 
 # Real wall-clock time, NOT a fixed historical constant like test_expiry.py's
@@ -580,3 +582,115 @@ class TestConfirmIdempotency:
             )
         assert len(confirmed_count) == 1
         await _assert_invariants(session_factory, event_id, 1)
+
+
+def _counter_value(counter, **labels) -> float:
+    for metric in counter.collect():
+        for sample in metric.samples:
+            if sample.name == f"{metric.name}_total" and sample.labels == labels:
+                return sample.value
+    return 0.0
+
+
+class TestOversellBlockedAtDatabaseLayer:
+    """Item 5: confirm is where oversell_blocked_total{layer="database"}
+    (app/infra/metrics.py -- dormant since Phase 1, "booking_seats isn't
+    written until Phase 5's confirm/booking path exists") finally gets a
+    firing point, via booking_seats' partial unique index. It should
+    stay at zero under every NORMAL confirm -- every other test in this
+    file confirms bookings without it ever firing -- so this test proves
+    the wiring itself works by forcing the one condition that should
+    make it fire: two different bookings' booking_seats rows both
+    targeting the same seat, active at once.
+
+    Reaching that condition through attempt_confirm_write's own seat-
+    status UPDATE (rather than inserting into booking_seats directly)
+    means the seat genuinely reaches BOOKED first, exactly as it would
+    under a real (hypothetical) upstream bug that let the seat-level
+    guard get bypassed -- this is deterministic failure injection at the
+    one layer meant to catch that, not a contrived shortcut around it.
+    """
+
+    async def test_second_active_booking_seats_row_for_same_seat_increments_metric(
+        self, session_factory
+    ):
+        event_id, seat_ids = await _seed_held_seats(session_factory, count=1, session_id="s1")
+        seat_id = seat_ids[0]
+
+        async with session_factory() as session:
+            first_booking_id = (
+                await session.execute(
+                    insert(BookingRow).returning(BookingRow.id),
+                    {
+                        "event_id": event_id,
+                        "user_id": 1,
+                        "session_id": "s1",
+                        "status": "PENDING",
+                        "total_amount": Decimal("10.00"),
+                        "currency": "USD",
+                        "seat_ids": [seat_id],
+                        "created_at": NOW,
+                    },
+                )
+            ).scalar_one()
+            await session.execute(
+                insert(BookingSeatRow), {"booking_id": first_booking_id, "seat_id": seat_id}
+            )
+            await session.commit()
+
+        # A SECOND booking, whose seat happens to still independently
+        # satisfy attempt_confirm_write's own seat-level guard (HELD by
+        # the same session, unexpired) -- simulating the seat-level
+        # check having been bypassed somehow for this second booking, so
+        # the ONLY thing left to catch the collision is booking_seats'
+        # own partial unique index.
+        async with session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE seats SET status='HELD', held_by_session_id='s1', "
+                    "hold_expires_at=:future, booking_id=NULL WHERE id=:seat_id"
+                ),
+                {"future": FUTURE, "seat_id": seat_id},
+            )
+            second_booking_id = (
+                await session.execute(
+                    insert(BookingRow).returning(BookingRow.id),
+                    {
+                        "event_id": event_id,
+                        "user_id": 1,
+                        "session_id": "s1",
+                        "status": "PENDING",
+                        "total_amount": Decimal("10.00"),
+                        "currency": "USD",
+                        "seat_ids": [seat_id],
+                        "created_at": NOW,
+                    },
+                )
+            ).scalar_one()
+            await session.commit()
+
+        before = _counter_value(oversell_blocked_total, layer="database")
+
+        async with session_factory() as session:
+            ok = await attempt_confirm_write(session, second_booking_id, [seat_id], "s1", NOW)
+
+        assert ok is False
+        assert _counter_value(oversell_blocked_total, layer="database") == before + 1
+
+        # The first booking's active booking_seats row is exactly what
+        # should have blocked the second -- I1 held, even though it took
+        # the database layer, not the application layer, to do it here.
+        async with session_factory() as session:
+            active_rows = (
+                (
+                    await session.execute(
+                        select(BookingSeatRow).where(
+                            BookingSeatRow.seat_id == seat_id, BookingSeatRow.released_at.is_(None)
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert len(active_rows) == 1
+        assert active_rows[0].booking_id == first_booking_id

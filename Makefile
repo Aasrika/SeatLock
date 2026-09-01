@@ -1,4 +1,4 @@
-.PHONY: up down logs test lint fmt run-api run-dev benchmark benchmark-sweep sweeper reconciler
+.PHONY: up down logs test lint fmt run-api run-dev benchmark benchmark-sweep sweeper reconciler idempotency-reaper payment-worker
 
 UVICORN_WORKERS ?= 4
 PROMETHEUS_MULTIPROC_DIR ?= .prometheus-multiproc
@@ -74,3 +74,11 @@ sweeper:
 
 reconciler:
 	python -m workers.reconciler
+
+# Phase 5, SPEC.md sections 6/7 -- same "separate process, same
+# database" shape as sweeper/reconciler above.
+idempotency-reaper:
+	python -m workers.idempotency_reaper
+
+payment-worker:
+	python -m workers.payment_worker
