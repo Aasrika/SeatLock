@@ -373,6 +373,120 @@ reconciliation_transient_total = Counter(
 )
 
 
+# --- idempotency (SPEC.md section 6, app/infra/idempotency.py) ---------
+idempotent_replay_total = Counter(
+    "idempotent_replay_total",
+    "A request arrived with an Idempotency-Key already COMPLETED with a "
+    "matching fingerprint -- the stored response was returned verbatim, "
+    "with no re-execution. Expected to be nonzero under normal client "
+    "retry behaviour (e.g. a client that never saw the first response due "
+    "to a network blip); it is not itself a bug signal.",
+)
+
+idempotency_conflict_total = Counter(
+    "idempotency_conflict_total",
+    "A request reused an Idempotency-Key already seen with a DIFFERENT "
+    "request fingerprint -- rejected 422. This is a client bug (SPEC.md "
+    "section 6): the same key must always mean the same request. Should "
+    "be at or near zero in a correctly-behaving client population.",
+)
+
+idempotency_in_progress_total = Counter(
+    "idempotency_in_progress_total",
+    "A request reused an Idempotency-Key whose original request is still "
+    "IN_PROGRESS -- rejected 409 with Retry-After. Expected under a "
+    "client that retries too eagerly (before the original request could "
+    "possibly have finished) or genuinely concurrent duplicate submission "
+    "(e.g. a double-click); not itself a bug signal.",
+)
+
+idempotency_stale_keys_reaped_total = Counter(
+    "idempotency_stale_keys_reaped_total",
+    "workers/idempotency_reaper.py found an IN_PROGRESS idempotency_keys "
+    "row past Settings.idempotency_stale_timeout_seconds with NO booking "
+    "carrying that key -- the original request crashed before doing any "
+    "durable work. Marked FAILED so a client retry is free to execute "
+    "for real. See idempotency_stale_keys_recovered_total for the OTHER "
+    "outcome of a stale scan (a booking DOES exist).",
+)
+
+idempotency_stale_keys_recovered_total = Counter(
+    "idempotency_stale_keys_recovered_total",
+    "workers/idempotency_reaper.py found an IN_PROGRESS idempotency_keys "
+    "row past timeout WHERE a booking already carries that key -- the "
+    "booking write itself succeeded and only the completion marker was "
+    "lost (e.g. a crash between the booking committing and the key being "
+    "marked COMPLETED). Recovered to COMPLETED with a response "
+    "reconstructed from the booking's current state, rather than being "
+    "marked FAILED -- marking it FAILED here would let a client retry "
+    "re-execute a request that already succeeded and double-book. "
+    "Nonzero values mean real crash recovery happened, which is the "
+    "system working as designed, not a bug signal by itself -- but a "
+    "sustained nonzero rate alongside no corresponding rate of actual "
+    "process crashes/restarts would be worth investigating.",
+)
+
+# --- payment webhooks (SPEC.md section 7, app/payments/) ----------------
+webhook_events_total = Counter(
+    "webhook_events_total",
+    "Every payment webhook request that reached signature verification, "
+    "by event type and outcome (outcome='accepted': durably inserted; "
+    "'duplicate': provider_event_id already seen, see "
+    "webhook_duplicate_total; 'unresolved': inserted but booking_id did "
+    "not resolve, see webhook_unresolved_total). Signature failures are "
+    "NOT included here (see webhook_signature_failures_total) -- an "
+    "unauthenticated request never reaches far enough to have a "
+    "meaningful event_type.",
+    ["type", "outcome"],
+)
+
+webhook_duplicate_total = Counter(
+    "webhook_duplicate_total",
+    "A webhook's provider_event_id unique-violated on INSERT -- already "
+    "processed (or already durably queued). Returned 200 immediately, "
+    "same as a fresh accept (SPEC.md section 7: never make a provider "
+    "distinguish 'duplicate' from 'accepted' by status code, or its own "
+    "retry behaviour turns into a retry storm against a 5xx). Expected "
+    "to be nonzero under normal provider behaviour -- most providers "
+    "retry aggressively by design.",
+)
+
+webhook_unresolved_total = Counter(
+    "webhook_unresolved_total",
+    "A webhook's payload did not carry a booking_id that resolves to an "
+    "existing booking (missing, malformed, or referencing an id that "
+    "does not exist -- e.g. a test event, or an event replayed from a "
+    "different environment's data). Still durably inserted with "
+    "processing_status='UNRESOLVED' and returned 200 -- rejecting it "
+    "would make a legitimate provider event retry forever, the same "
+    "retry-storm failure mode a 500 on a duplicate would cause.",
+)
+
+webhook_signature_failures_total = Counter(
+    "webhook_signature_failures_total",
+    "HMAC verification failed over the raw request body -- rejected 401, "
+    "nothing inserted. Should be at or near zero from the real provider; "
+    "sustained nonzero values mean either a misconfigured shared secret "
+    "or a genuine forgery attempt, and this is the metric to alert on "
+    "for the latter.",
+)
+
+late_payment_refund_required_total = Counter(
+    "late_payment_refund_required_total",
+    "A payment.succeeded event was applied to a booking whose hold had "
+    "already expired and been resold to a different booking by the time "
+    "the payment cleared (SPEC.md section 7's 'late-success case'). The "
+    "booking moved to REFUND_REQUIRED; the seat was NOT touched -- money "
+    "is reversible, a seat someone else now legitimately holds is not. "
+    "Same fail-toward-the-recoverable-side principle as "
+    "workers/sweeper.py's Postgres-then-Redis delete ordering and Phase "
+    "4's lazy expiry. Never expected to be zero forever under real "
+    "payment-gateway latency variance, but a sustained high rate would "
+    "point at hold_duration_seconds being too short relative to actual "
+    "payment processing time.",
+)
+
+
 def render_metrics_text() -> bytes:
     """Aggregate every worker's per-process metric files into one
     Prometheus text-format payload. See module docstring for why this is

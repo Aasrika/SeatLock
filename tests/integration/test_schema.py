@@ -62,6 +62,7 @@ async def _insert_booking(conn: AsyncConnection, event_id: int, **overrides: Any
         "status": "PENDING",
         "total_amount": Decimal("42.00"),
         "currency": "USD",
+        "seat_ids": [],
     }
     values.update(overrides)
     result = await conn.execute(insert(BookingRow).returning(BookingRow.id), values)

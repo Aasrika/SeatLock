@@ -136,5 +136,54 @@ class Settings(BaseSettings):
     # most likely to be pure timing noise.
     reconciler_recent_change_grace_seconds: float = 2.0
 
+    # --- Phase 5: idempotency (SPEC.md section 6) ---------------------
+    #
+    # How long an IN_PROGRESS idempotency_keys row can sit unfinished
+    # before workers/idempotency_reaper.py treats it as abandoned (a
+    # crashed request, not a slow one). 60s per the Phase 5 plan --
+    # comfortably longer than any booking/confirm transaction should ever
+    # take, short enough that a genuinely stuck client isn't blocked for
+    # long behind a 409.
+    idempotency_stale_timeout_seconds: float = 60.0
+    # Deliberately shorter than the timeout above, not equal to it: if the
+    # reaper only ran once per timeout window, a key could sit reapable
+    # for up to one full extra interval before anything noticed. Running
+    # at roughly half the timeout bounds that detection lag without
+    # scanning needlessly often.
+    idempotency_reaper_interval_seconds: float = 30.0
+    # SKIP LOCKED batch size for the reaper's scan -- same tradeoff as
+    # Settings.sweeper_batch_size (workers/sweeper.py), reused here rather
+    # than invented fresh: this table is expected to be far smaller and
+    # far less hot than seats, so no separate tuning knob is justified
+    # yet.
+    idempotency_reaper_batch_size: int = 100
+    # How long an idempotency_keys row is considered valid for replay
+    # after COMPLETED -- SPEC.md section 3 specifies the expires_at
+    # column but not a value. 24h: long enough to cover any realistic
+    # client retry window (including a user closing their laptop and
+    # retrying the next morning), short enough that this table doesn't
+    # grow unboundedly forever with no retention story. No cleanup job
+    # consumes this yet (see IdempotencyKeyRow's own docstring) -- the
+    # column and this default exist so one can be added later without a
+    # schema change.
+    idempotency_key_ttl_seconds: float = 86400.0
+
+    # --- Phase 5: payment webhooks (SPEC.md section 7) -----------------
+    #
+    # HMAC-SHA256 secret shared with the (mocked, per SPEC.md section 15's
+    # declared scope cut) payment provider. INSECURE PLACEHOLDER DEFAULT --
+    # every real deployment must override this via .env; it is not
+    # validated as non-default here for the same reason
+    # postgres_password isn't: this project's threat model stops at "the
+    # signature check exists and is exercised by tests," not secret
+    # management.
+    webhook_hmac_secret: str = "dev-webhook-secret-change-me"
+    # workers/payment_worker.py's poll interval for unprocessed
+    # payment_events. Short: SPEC.md section 7's "fast ack, async
+    # process" means the ack (webhook route's 200) is already fast --
+    # this just controls how quickly the ASYNC effect follows it.
+    payment_worker_interval_seconds: float = 5.0
+    payment_worker_batch_size: int = 100
+
 
 settings = Settings()

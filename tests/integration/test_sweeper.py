@@ -77,6 +77,7 @@ async def _seed_seats(session_factory, seats: list[dict]) -> tuple[int, list[int
                             "status": "CONFIRMED",
                             "total_amount": "0.00",
                             "currency": "USD",
+                            "seat_ids": [],
                         },
                     )
                 ).scalar_one()

@@ -29,7 +29,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # This naming convention must exist before the first migration is
@@ -131,6 +131,21 @@ class BookingRow(Base):
     # VARCHAR, not CHAR: Postgres blank-pads CHAR(n), which produces
     # surprising trailing-space behaviour on comparison and export.
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    # Which seats this booking claims -- set once, at creation, and never
+    # revised. NOT expressed via SeatRow.booking_id: that column is
+    # written only by app/domain/state_machine.py's hold()/confirm()
+    # (deliberately None while HELD, set together with BOOKED), and
+    # app/domain/invariants.py's check_state_coherence() has always
+    # required exactly that (HELD -> booking_id None). A PENDING booking
+    # created before confirm still needs to know which seats it claims,
+    # but writing SeatRow.booking_id on a still-HELD seat to record that
+    # would violate that invariant -- confirmed directly: an early
+    # version of app/booking/create.py did exactly this and
+    # check_state_coherence caught it immediately in
+    # tests/integration/test_idempotency.py. This column is the fix:
+    # app/booking/create.py and .../confirm.py read/write it instead of
+    # touching seats at all until the seat is genuinely BOOKED.
+    seat_ids: Mapped[list[int]] = mapped_column(ARRAY(BigInteger), nullable=False)
     # Filed in Phase 0 as "a lookup aid only" (see the old comment this one
     # replaces) -- turns out to be load-bearing for crash recovery instead
     # (Phase 5): it always holds the Idempotency-Key of whichever operation
