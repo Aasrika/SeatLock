@@ -24,6 +24,11 @@ dev = [
     "hypothesis",
     "ruff",
     "mypy",
+    # loadtest/chaos/actions.py -- cross-platform-ish process introspection
+    # to find and kill exactly one of the 4 uvicorn worker child processes
+    # (scenario e), without shelling out to wmic (deprecated/inconsistent
+    # on Windows 11) or fragile PowerShell text parsing.
+    "psutil",
 ]
 
 [build-system]

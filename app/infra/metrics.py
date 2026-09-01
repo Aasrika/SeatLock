@@ -497,8 +497,7 @@ late_payment_refund_required_total = Counter(
 # contributing a stale count forever, which plain "sum" would allow).
 ws_connections_gauge = Gauge(
     "ws_connections",
-    "Currently open WebSocket connections, summed across all live "
-    "uvicorn workers.",
+    "Currently open WebSocket connections, summed across all live uvicorn workers.",
     multiprocess_mode="livesum",
 )
 

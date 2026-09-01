@@ -1,4 +1,4 @@
-.PHONY: up down logs test lint fmt run-api run-dev benchmark benchmark-sweep sweeper reconciler idempotency-reaper payment-worker
+.PHONY: up down logs test lint fmt run-api run-dev benchmark benchmark-sweep sweeper reconciler idempotency-reaper payment-worker chaos
 
 UVICORN_WORKERS ?= 4
 PROMETHEUS_MULTIPROC_DIR ?= .prometheus-multiproc
@@ -82,3 +82,15 @@ idempotency-reaper:
 
 payment-worker:
 	python -m workers.payment_worker
+
+# Phase 8a, SPEC.md section 10 Layer 5 -- self-contained, unlike every
+# target above: this one starts and stops docker compose, the API (4
+# workers), and the sweeper/reconciler/payment_worker itself, once fresh
+# per scenario (loadtest/chaos/run_all.py's own module docstring has the
+# full reasoning). Do NOT run `make run-api` first -- it would fight this
+# target for port 8000.
+#
+#   make chaos                                    # all six scenarios
+#   make chaos ARGS="--only redis_killed,redis_paused"
+chaos:
+	python -m loadtest.chaos.run_all $(ARGS)

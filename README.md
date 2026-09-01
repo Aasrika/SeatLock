@@ -144,6 +144,20 @@ scattered call sites.
   once — the id is the row's own primary key, so "already seen" is a
   database-level unique violation, not a racy application check.
 
+**"Redis is a cache, not a source of truth" is a claim this project
+tests, not just states.** [docs/chaos-results.md](docs/chaos-results.md)
+kills Redis outright, pauses it (a hang, not a crash), and kills-and-
+restarts it empty (a real data loss — persistence is disabled on
+purpose) under real concurrent load, and checks all five invariants the
+whole time. All three passed with zero invariant violations; holds and
+confirms kept succeeding throughout every one of them, on Postgres
+alone. The same document also killed the sweeper outright to test I3's
+own "cleanup, not mechanism" claim, killed one of four API workers
+mid-transaction, and restarted Postgres mid-load — the last of those
+found and fixed two real bugs (a missing Redis timeout, and three
+distinct ways a Postgres restart could surface as a bare 500 instead of
+503) rather than just confirming the design worked.
+
 ---
 
 ## Measurement failures found and corrected

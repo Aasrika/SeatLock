@@ -195,8 +195,26 @@ class RealtimeHub:
                 await self._pubsub.unsubscribe(channel_name(event_id, section))
 
     async def _listen_loop(self) -> None:
+        """Found by Phase 8a's chaos suite (loadtest/chaos/), not by any
+        Redis/Postgres injection: with zero WebSocket clients ever
+        connected (true for every chaos scenario -- none of them open a
+        WS connection), `_add_subscriber` is never called, so
+        `self._pubsub.subscribe(...)` never runs. redis-py's PubSub
+        object has no underlying connection at all until its first
+        subscribe(), and calling get_message() before that raises
+        "pubsub connection not set" -- forever, at 10Hz (the except
+        branch's own throttle), pure log noise with no other effect
+        (nothing downstream depends on this loop's output when there is
+        nothing subscribed to receive). Skipping the call entirely while
+        there are no local subscribers avoids that noise instead of
+        catching-and-retrying an error that a real subscribe() would
+        have prevented in the first place.
+        """
         assert self._pubsub is not None
         while True:
+            if not self._subscribers:
+                await asyncio.sleep(0.1)
+                continue
             try:
                 message = await self._pubsub.get_message(
                     ignore_subscribe_messages=True, timeout=1.0

@@ -10,8 +10,14 @@ __pycache__/
 # Generated benchmark output (loadtest/run_benchmark.py) — not source.
 loadtest/results/
 
+# Generated chaos-suite output (loadtest/chaos/run_all.py) — raw per-poll
+# timelines and k6 dumps, regenerable via `make chaos`; the curated
+# analysis lives in docs/chaos-results.md, which IS committed.
+loadtest/chaos/results/
+
 # Per-process Prometheus metric files (multiprocess mode) — not source.
 .prometheus-multiproc/
+.prometheus-multiproc-chaos/
 
 # Frontend
 web/node_modules/

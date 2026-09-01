@@ -19,6 +19,32 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://seatlock:seatlock_local_dev@localhost:5432/seatlock"
 
     redis_url: str = "redis://localhost:6379/0"
+    # Bounds on every Redis command/connection this process issues.
+    # UNCONFIGURED, these are unbounded -- and a paused (not killed) Redis
+    # is a real difference: `docker pause` freezes the redis-server
+    # process via the cgroup freezer, but the container's network
+    # namespace stays up at the kernel level, so a NEW TCP connection can
+    # still complete its handshake (the kernel accepts it into the listen
+    # backlog independently of the frozen process ever calling accept()).
+    # The result is a connection that looks alive but never answers --
+    # exactly the "hang, not a crash" case Phase 8's chaos suite is built
+    # to find. Both app/infra/hold_cache.py's mirror SET and
+    # app/realtime/pubsub.py's PUBLISH are awaited INLINE in the booking
+    # request path (create_hold/extend_hold/confirm_booking), so without
+    # these timeouts a paused Redis turns directly into hung API requests
+    # and, eventually, an exhausted event loop -- a cache outage becoming
+    # an API outage. redis-py's TimeoutError subclasses RedisError, so
+    # every existing `except RedisError` call site already catches it with
+    # no changes needed there.
+    #
+    # 2.0s each: long enough that a real Redis round-trip (even under
+    # load, even reconnecting) never trips it, short enough that a paused
+    # Redis costs a bounded ~2-4s per request (two sequential Redis
+    # touches on the hold path: mirror-set, then publish) instead of
+    # forever. See docs/chaos-results.md (scenario b) for the measured
+    # effect of this value on booking throughput during a Redis pause.
+    redis_socket_timeout_seconds: float = 2.0
+    redis_socket_connect_timeout_seconds: float = 2.0
 
     # Which SeatAcquisitionStrategy app/inventory/strategies/base.py wires
     # up. Only "naive" exists (Phase 1); "pessimistic" and "optimistic"
