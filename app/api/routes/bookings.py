@@ -128,7 +128,7 @@ async def create_booking_route(
     # own writes above -- see app/infra/idempotency.py's module docstring
     # for why this one shared commit is the entire point.
     await idempotency.complete_idempotent_request(
-        session, idempotency_key, response_status, response_body
+        session, idempotency_key, body.user_id, response_status, response_body
     )
     await session.commit()
 
@@ -194,7 +194,7 @@ async def confirm_booking_route(
         response_body = {"reason": exc.reason}
 
     await idempotency.complete_idempotent_request(
-        session, idempotency_key, response_status, response_body
+        session, idempotency_key, booking.user_id, response_status, response_body
     )
     await session.commit()
 

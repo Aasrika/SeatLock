@@ -19,9 +19,14 @@ client retry, which would re-execute a request that ALREADY SUCCEEDED --
 double-booking or double-confirming.
 
 So: before flipping any stale IN_PROGRESS row, check whether a booking
-already carries that key (BookingRow.idempotency_key, updated by both
-app/booking/create.py and app/booking/confirm.py's transactions, always
-holding whichever operation most recently touched that booking).
+already carries that (user_id, key) (BookingRow.idempotency_key,
+updated by both app/booking/create.py and app/booking/confirm.py's
+transactions, always holding whichever operation most recently touched
+that booking) -- scoped by user_id, not idempotency_key alone, for the
+same reason app/infra/idempotency.py's own lookups are (see
+IdempotencyKeyRow's docstring): two different users can legitimately
+submit the identical key string, and matching on the string alone here
+would risk recovering the WRONG user's booking for a stale row.
 
     booking EXISTS -> the write succeeded; recover to COMPLETED with a
         response rebuilt from the booking's current state
@@ -86,7 +91,7 @@ async def reap_once(
                     IdempotencyKeyRow.status == "IN_PROGRESS",
                     IdempotencyKeyRow.created_at <= cutoff,
                 )
-                .order_by(IdempotencyKeyRow.key)
+                .order_by(IdempotencyKeyRow.user_id, IdempotencyKeyRow.key)
                 .limit(settings.idempotency_reaper_batch_size)
                 .with_for_update(skip_locked=True)
             )
@@ -99,7 +104,11 @@ async def reap_once(
     reaped = 0
     for row in stale_rows:
         booking = (
-            await session.execute(select(BookingRow).where(BookingRow.idempotency_key == row.key))
+            await session.execute(
+                select(BookingRow).where(
+                    BookingRow.user_id == row.user_id, BookingRow.idempotency_key == row.key
+                )
+            )
         ).scalar_one_or_none()
 
         if booking is not None:

@@ -171,18 +171,26 @@ class BookingRow(Base):
             "status IN ('PENDING', 'CONFIRMED', 'CANCELLED', 'REFUNDED', 'REFUND_REQUIRED')",
             name="booking_status_valid",
         ),
-        # Unique (Phase 5, was a non-unique lookup index in Phase 0): now
-        # that idempotency_reaper.py relies on "at most one booking per
-        # key" to recover cleanly, two bookings silently sharing a key
-        # would make that recovery lookup ambiguous. Partial, WHERE NOT
-        # NULL: Postgres's plain unique indexes already never treat two
-        # NULLs as colliding, so this WHERE clause changes nothing about
-        # actual behaviour -- it is here so a future reader doesn't need
-        # to already know that Postgres default in order to see that
-        # bookings created outside the idempotency path (idempotency_key
-        # left NULL) are deliberately, not accidentally, exempt here.
+        # Unique on (user_id, idempotency_key), NOT idempotency_key alone
+        # (Phase 5, was a non-unique lookup index in Phase 0) -- matching
+        # idempotency_keys' own composite primary key (see that table's
+        # docstring: Idempotency-Key is client-supplied, untrusted input,
+        # so two DIFFERENT users legitimately reusing the same key string
+        # must never collide with each other, only within one user's own
+        # keys). idempotency_reaper.py relies on "at most one booking per
+        # (user_id, key)" to recover cleanly -- a bare idempotency_key
+        # uniqueness would both reject that legitimate cross-user reuse
+        # AND make the reaper's own recovery lookup ambiguous the moment
+        # it happened anyway. Partial, WHERE NOT NULL: Postgres's plain
+        # unique indexes already never treat two NULLs as colliding, so
+        # this WHERE clause changes nothing about actual behaviour -- it
+        # is here so a future reader doesn't need to already know that
+        # Postgres default in order to see that bookings created outside
+        # the idempotency path (idempotency_key left NULL) are
+        # deliberately, not accidentally, exempt here.
         Index(
             None,
+            "user_id",
             "idempotency_key",
             unique=True,
             postgresql_where=text("idempotency_key IS NOT NULL"),
@@ -254,12 +262,31 @@ class IdempotencyKeyRow(Base):
     /api/bookings/{id}/confirm) -- see app/infra/idempotency.py for the
     four-case flow this table drives, and workers/idempotency_reaper.py
     for what happens to a row that never leaves IN_PROGRESS.
+
+    PRIMARY KEY IS (user_id, key), NOT key alone -- security fix, not a
+    style choice. Idempotency-Key is CLIENT-supplied, untrusted input.
+    With `key` alone as the primary key, a second user submitting a key
+    they observed (or guessed, or coincidentally chose) another user
+    already used would hit a unique violation against THAT OTHER USER'S
+    row, and if their request happened to fingerprint identically, the
+    lookup would return -- and, on COMPLETED, replay verbatim -- a
+    response describing someone else's booking. The locking layers
+    elsewhere in this codebase would still prevent any seat from being
+    double-allocated; the leak is entirely in this table serving the
+    wrong user's stored response. Same class of bug as an IDOR check
+    missing on GET /bookings/{id}: any lookup keyed on attacker-
+    controlled input must be scoped to the authenticated principal.
+    Scoping by (user_id, key) means a second user's request against a
+    key it does not own never finds a row to collide with at all -- it
+    just proceeds as a fresh attempt, exactly as if the key were unused.
+    Every query against this table (app/infra/idempotency.py,
+    workers/idempotency_reaper.py) must include user_id, never key alone.
     """
 
     __tablename__ = "idempotency_keys"
 
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     key: Mapped[str] = mapped_column(String, primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     request_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     response_status: Mapped[int | None] = mapped_column(Integer, nullable=True)

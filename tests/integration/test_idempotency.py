@@ -250,6 +250,87 @@ class TestSameKeyDifferentBody:
         assert await _booking_count(session_factory, event_id) == 1
 
 
+class TestCrossUserKeyIsolation:
+    """Security fix: Idempotency-Key is CLIENT-supplied, untrusted input.
+    Two different users submitting the SAME key value (accidentally, or
+    deliberately -- an attacker replaying a key they observed) must
+    never see each other's data. Before idempotency_keys' primary key
+    was (user_id, key) rather than key alone, user B's request here
+    would have collided with user A's row and, on this test's identical-
+    body setup, replayed A's stored response verbatim: a 201 carrying
+    A's booking id, for a booking B does not own. The locking layers
+    were never at risk (no seat is double-allocated either way) -- the
+    leak was entirely in the response layer serving the wrong user's
+    data. Same class of bug as a missing IDOR check on GET /bookings/{id}.
+    """
+
+    async def test_same_key_different_users_execute_independently(self, session_factory):
+        event_id_a, seat_ids_a = await _seed_held_seats(
+            session_factory, count=1, session_id="user-a-s1"
+        )
+        event_id_b, seat_ids_b = await _seed_held_seats(
+            session_factory, count=1, session_id="user-b-s1"
+        )
+        shared_key = "shared-idempotency-key-across-users"
+
+        # Bodies are otherwise IDENTICAL in shape (same amount/currency) --
+        # only event/seat/session/user differ, exactly the scenario where
+        # a bare-key lookup could have coincidentally matched fingerprints
+        # too and made this leak worse, not better.
+        body_a = _create_body(event_id_a, seat_ids_a, "user-a-s1", user_id=101)
+        body_b = _create_body(event_id_b, seat_ids_b, "user-b-s1", user_id=202)
+
+        response_a = await _call_create(session_factory, shared_key, body_a)
+        response_b = await _call_create(session_factory, shared_key, body_b)
+
+        # Neither is a replay -- both executed for real.
+        assert isinstance(response_a, BookingResponse), (
+            f"expected fresh execution, got {response_a!r}"
+        )
+        assert isinstance(response_b, BookingResponse), (
+            f"expected fresh execution, got {response_b!r}"
+        )
+
+        assert response_a.user_id == 101
+        assert response_b.user_id == 202
+        assert response_a.id != response_b.id
+        assert response_a.event_id == event_id_a
+        assert response_b.event_id == event_id_b
+
+        # Each user's own booking, and only their own.
+        assert await _booking_count(session_factory, event_id_a) == 1
+        assert await _booking_count(session_factory, event_id_b) == 1
+
+        # Both idempotency_keys rows exist, distinct by (user_id, key) --
+        # not a single row one user's request overwrote the other's.
+        async with session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(IdempotencyKeyRow).where(IdempotencyKeyRow.key == shared_key)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert len(rows) == 2
+        assert {row.user_id for row in rows} == {101, 202}
+        assert {row.response_body["id"] for row in rows} == {response_a.id, response_b.id}
+
+        # A same-key retry for EACH user still replays only their OWN
+        # response -- confirming the isolation holds after the fact too,
+        # not just on the two original, simultaneous-looking calls.
+        replay_a = await _call_create(session_factory, shared_key, body_a)
+        replay_b = await _call_create(session_factory, shared_key, body_b)
+        assert _response_body(replay_a)["id"] == response_a.id
+        assert _response_body(replay_b)["id"] == response_b.id
+        assert await _booking_count(session_factory, event_id_a) == 1
+        assert await _booking_count(session_factory, event_id_b) == 1
+
+        await _assert_invariants(session_factory, event_id_a, 1)
+        await _assert_invariants(session_factory, event_id_b, 1)
+
+
 class TestConcurrentSameKey:
     """(c): concurrent requests with the same key -> exactly one executes,
     the rest get 409 or the stored response, never two bookings.

@@ -19,7 +19,7 @@ exposes two explicit calls a route makes itself, both against the SAME
     outcome = await begin_idempotent_request(session, key, user_id,
                                               fingerprint, now, ttl_seconds)
     # ... New: do the actual business logic against `session`, no commit ...
-    await complete_idempotent_request(session, key, status, body, now)
+    await complete_idempotent_request(session, key, user_id, status, body)
     await session.commit()   # ONE commit: the booking write AND this row
 
 `begin_idempotent_request` itself still needs its own immediately-committed
@@ -30,6 +30,16 @@ split is unavoidable and is exactly why workers/idempotency_reaper.py
 cannot simply trust "IN_PROGRESS past timeout == abandoned": it must
 belt-and-suspenders check whether a booking already carries the key before
 concluding that (see that module's docstring).
+
+SECURITY: Idempotency-Key is client-supplied, untrusted input. Every
+query in this module filters on (user_id, key) together -- matching
+idempotency_keys' own composite primary key (see IdempotencyKeyRow's
+docstring) -- never on key alone. A lookup scoped by key alone would let
+one user's request find (and, on a fingerprint coincidence, be served)
+a DIFFERENT user's stored response merely by submitting a key that user
+happened to use first. Same class of bug as a missing IDOR check on
+GET /bookings/{id}: any lookup keyed on attacker-controlled input must
+be scoped to the authenticated principal.
 """
 
 from __future__ import annotations
@@ -122,6 +132,15 @@ async def begin_idempotent_request(
     """Its own short transaction, committed immediately -- see module
     docstring for why this commit cannot be deferred to join the caller's
     later one.
+
+    SECURITY: every query here filters on BOTH user_id and key, never key
+    alone -- see IdempotencyKeyRow's own docstring. Idempotency-Key is
+    client-supplied, untrusted input; a lookup scoped by key alone would
+    let user B's request find (and, on a fingerprint coincidence, be
+    served) user A's stored response for a key A happened to use first.
+    Scoping by (user_id, key) means B's request against a key it does
+    not own never finds a row at all -- it just proceeds as New(), the
+    same as if the key had never been used by anyone.
     """
     try:
         await session.execute(
@@ -140,7 +159,11 @@ async def begin_idempotent_request(
         await session.rollback()
 
     existing = (
-        await session.execute(select(IdempotencyKeyRow).where(IdempotencyKeyRow.key == key))
+        await session.execute(
+            select(IdempotencyKeyRow).where(
+                IdempotencyKeyRow.user_id == user_id, IdempotencyKeyRow.key == key
+            )
+        )
     ).scalar_one()
 
     if existing.request_fingerprint != fingerprint:
@@ -155,17 +178,21 @@ async def begin_idempotent_request(
 
     if existing.status == "FAILED":
         # Reclaim: the reaper only ever marks a row FAILED when NO
-        # booking carries its key (see idempotency_reaper.py) -- there is
-        # genuinely nothing this retry could double-book by re-executing,
-        # so flip the SAME row back to IN_PROGRESS rather than erroring.
-        # The WHERE clause's own status='FAILED' guard is what makes this
-        # safe under a concurrent second retry doing the same thing: only
-        # one UPDATE can match, the other sees rowcount 0 and falls back
-        # to reporting InProgress below, same as any other genuinely
-        # concurrent duplicate submission.
+        # booking carries its (user_id, key) (see idempotency_reaper.py)
+        # -- there is genuinely nothing this retry could double-book by
+        # re-executing, so flip the SAME row back to IN_PROGRESS rather
+        # than erroring. The WHERE clause's own status='FAILED' guard is
+        # what makes this safe under a concurrent second retry doing the
+        # same thing: only one UPDATE can match, the other sees rowcount
+        # 0 and falls back to reporting InProgress below, same as any
+        # other genuinely concurrent duplicate submission.
         result = await session.execute(
             sa_update(IdempotencyKeyRow)
-            .where(IdempotencyKeyRow.key == key, IdempotencyKeyRow.status == "FAILED")
+            .where(
+                IdempotencyKeyRow.user_id == user_id,
+                IdempotencyKeyRow.key == key,
+                IdempotencyKeyRow.status == "FAILED",
+            )
             .values(
                 status="IN_PROGRESS",
                 created_at=now,
@@ -190,15 +217,24 @@ async def begin_idempotent_request(
 
 
 async def complete_idempotent_request(
-    session: AsyncSession, key: str, response_status: int, response_body: dict[str, Any]
+    session: AsyncSession,
+    key: str,
+    user_id: int,
+    response_status: int,
+    response_body: dict[str, Any],
 ) -> None:
     """Call using the SAME session as the operation's own writes, and let
     the CALLER commit once, covering both. Deliberately does not commit
     here itself -- see module docstring; this is the entire point of
     Phase 5 item 2.
+
+    user_id is required, not optional -- see begin_idempotent_request's
+    own comment: every query against this table must be scoped by
+    (user_id, key), and an UPDATE keyed on `key` alone would silently
+    complete/overwrite whichever user's row happens to have that key.
     """
     await session.execute(
         sa_update(IdempotencyKeyRow)
-        .where(IdempotencyKeyRow.key == key)
+        .where(IdempotencyKeyRow.user_id == user_id, IdempotencyKeyRow.key == key)
         .values(status="COMPLETED", response_status=response_status, response_body=response_body)
     )
