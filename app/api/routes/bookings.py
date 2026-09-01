@@ -22,6 +22,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.booking.confirm import (
@@ -35,6 +36,9 @@ from app.booking.responses import BookingResponse
 from app.infra import idempotency
 from app.infra.config import settings
 from app.infra.db import get_session
+from app.infra.redis import get_redis
+from app.infra.tables import SeatRow
+from app.realtime.pubsub import publish_seat_update
 
 router = APIRouter()
 
@@ -197,6 +201,31 @@ async def confirm_booking_route(
         session, idempotency_key, booking.user_id, response_status, response_body
     )
     await session.commit()
+
+    # Realtime fanout (Phase 7): AFTER commit, only on an actual
+    # confirmation -- a replayed/rejected outcome changed nothing for a
+    # viewer to see. attempt_confirm_write() (app/booking/confirm.py)
+    # never commits itself (this route's commit above is the one that
+    # makes the confirm real), so publishing has to happen here, not
+    # inside that function -- same reasoning as every other publish
+    # point in this codebase: after commit, never before.
+    if response is not None:
+        seat_rows = (
+            (await session.execute(select(SeatRow).where(SeatRow.id.in_(response.seat_ids))))
+            .scalars()
+            .all()
+        )
+        redis_client = get_redis()
+        for row in seat_rows:
+            await publish_seat_update(
+                redis_client,
+                event_id=row.event_id,
+                section=row.section,
+                seat_id=row.id,
+                status=row.status,
+                hold_expires_at=row.hold_expires_at,
+                version=row.version,
+            )
 
     if response is None:
         return JSONResponse(status_code=response_status, content=response_body)

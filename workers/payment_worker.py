@@ -58,7 +58,9 @@ from app.infra.config import settings
 from app.infra.db import async_session_factory
 from app.infra.mappers import booking_to_domain
 from app.infra.metrics import late_payment_refund_required_total
+from app.infra.redis import get_redis
 from app.infra.tables import BookingRow, OutboxRow, PaymentEventRow, SeatRow
+from app.realtime.pubsub import publish_seat_update
 
 log = structlog.get_logger(__name__)
 
@@ -96,22 +98,26 @@ async def _seats_still_valid_for_booking(
     )
 
 
-async def _apply_payment_succeeded(session: AsyncSession, booking_id: int, now: datetime) -> str:
-    """Returns the terminal processing_status to record: 'APPLIED' or
-    'REJECTED'. Never raises for a business-level outcome (illegal
-    transition, late success) -- those are all legitimate results this
-    function itself decides between, not errors.
+async def _apply_payment_succeeded(
+    session: AsyncSession, booking_id: int, now: datetime
+) -> tuple[str, set[int]]:
+    """Returns (terminal processing_status, seat_ids whose status
+    actually changed -- for realtime fanout AFTER process_once's own
+    commit, see that function). Never raises for a business-level
+    outcome (illegal transition, late success) -- those are all
+    legitimate results this function itself decides between, not
+    errors.
     """
     booking = await load_booking(session, booking_id)
     if booking is None:
-        return "REJECTED"  # defensive; booking_id was resolved at ingest time
+        return "REJECTED", set()  # defensive; booking_id was resolved at ingest time
 
     if booking.status == "CONFIRMED":
         # Already confirmed -- by the synchronous confirm route racing
         # this event, or by an earlier delivery of this same event
         # somehow reaching here twice. Idempotent no-op (I5: same effect
         # N times == once), not an illegal transition to log/count.
-        return "APPLIED"
+        return "APPLIED", set()
 
     if booking.status != "PENDING":
         # REFUNDED, REFUND_REQUIRED, or CANCELLED -- SPEC.md section 7's
@@ -130,21 +136,21 @@ async def _apply_payment_succeeded(session: AsyncSession, booking_id: int, now: 
                 from_status=booking.status,
                 reason=str(exc),
             )
-        return "REJECTED"
+        return "REJECTED", set()
 
     if not await _seats_still_valid_for_booking(session, booking, now):
         # THE LATE-SUCCESS CASE -- see module docstring.
         try:
             domain_require_refund(booking_to_domain(booking), now)
         except IllegalBookingTransition:
-            return "REJECTED"  # can't happen: status == PENDING was just checked
+            return "REJECTED", set()  # can't happen: status == PENDING was just checked
         result = await session.execute(
             sa_update(BookingRow)
             .where(BookingRow.id == booking_id, BookingRow.status == "PENDING")
             .values(status="REFUND_REQUIRED")
         )
         if result.rowcount != 1:
-            return "REJECTED"  # raced with something else; next delivery (if any) retries
+            return "REJECTED", set()  # raced with something; next delivery (if any) retries
         await session.execute(
             insert(OutboxRow),
             {
@@ -159,7 +165,9 @@ async def _apply_payment_succeeded(session: AsyncSession, booking_id: int, now: 
         )
         late_payment_refund_required_total.inc()
         log.info("payment_worker.late_success_refund_required", booking_id=booking_id)
-        return "APPLIED"
+        # Seat NOT touched -- see module docstring -- so nothing to
+        # publish for the realtime seat map either.
+        return "APPLIED", set()
 
     # Seats still validly held for this booking -- confirm, via the SAME
     # write attempt_confirm_write's own docstring says is shared with the
@@ -176,14 +184,16 @@ async def _apply_payment_succeeded(session: AsyncSession, booking_id: int, now: 
         # REJECTED leaves this event's outcome visible without silently
         # retrying it automatically (this worker does not re-queue
         # events -- see module docstring's scope).
-        return "REJECTED"
-    return "APPLIED"
+        return "REJECTED", set()
+    return "APPLIED", set(booking.seat_ids)
 
 
-async def _apply_payment_refunded(session: AsyncSession, booking_id: int, now: datetime) -> str:
+async def _apply_payment_refunded(
+    session: AsyncSession, booking_id: int, now: datetime
+) -> tuple[str, set[int]]:
     booking = await load_booking(session, booking_id)
     if booking is None:
-        return "REJECTED"
+        return "REJECTED", set()
 
     try:
         refunded = domain_refund_booking(booking_to_domain(booking), now)
@@ -194,7 +204,7 @@ async def _apply_payment_refunded(session: AsyncSession, booking_id: int, now: d
             from_status=booking.status,
             reason=str(exc),
         )
-        return "REJECTED"
+        return "REJECTED", set()
 
     result = await session.execute(
         sa_update(BookingRow)
@@ -202,7 +212,7 @@ async def _apply_payment_refunded(session: AsyncSession, booking_id: int, now: d
         .values(status=refunded.status.value)
     )
     if result.rowcount != 1:
-        return "REJECTED"
+        return "REJECTED", set()
 
     # Release the seats back to AVAILABLE -- the domain-legal counterpart
     # to attempt_confirm_write's BOOKED transition. Uses
@@ -227,7 +237,7 @@ async def _apply_payment_refunded(session: AsyncSession, booking_id: int, now: d
             "created_at": now,
         },
     )
-    return "APPLIED"
+    return "APPLIED", set(booking.seat_ids)
 
 
 _HANDLERS = {
@@ -253,6 +263,7 @@ async def process_once(session: AsyncSession, batch_size: int, now: datetime) ->
 
     applied = 0
     rejected = 0
+    touched_seat_ids: set[int] = set()
     for event in rows:
         handler = _HANDLERS.get(event.event_type)
         if handler is None:
@@ -265,15 +276,40 @@ async def process_once(session: AsyncSession, batch_size: int, now: datetime) ->
         # ever leaves processing_status NULL (this query's own filter)
         # when booking_id resolved at ingest time (see PaymentEventRow's
         # docstring / app/payments/ingest.py).
-        status_value = await handler(session, event.booking_id, now)
+        status_value, seat_ids = await handler(session, event.booking_id, now)
         event.processing_status = status_value
         event.processed_at = now
+        touched_seat_ids |= seat_ids
         if status_value == "APPLIED":
             applied += 1
         else:
             rejected += 1
 
     await session.commit()
+
+    # Realtime fanout (Phase 7): AFTER the batch's own commit, never
+    # before -- same ordering principle as every other publish point.
+    # One follow-up SELECT for every seat this batch touched, across
+    # however many bookings/events were involved, rather than
+    # publishing per-handler-call before the commit that makes each
+    # change real has actually happened.
+    if touched_seat_ids:
+        redis_client = get_redis()
+        rows_after = (
+            (await session.execute(select(SeatRow).where(SeatRow.id.in_(touched_seat_ids))))
+            .scalars()
+            .all()
+        )
+        for row in rows_after:
+            await publish_seat_update(
+                redis_client,
+                event_id=row.event_id,
+                section=row.section,
+                seat_id=row.id,
+                status=row.status,
+                hold_expires_at=row.hold_expires_at,
+                version=row.version,
+            )
 
     return ProcessBatchResult(processed=len(rows), applied=applied, rejected=rejected)
 

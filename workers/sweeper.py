@@ -109,7 +109,9 @@ from app.infra.metrics import (
     sweeper_lock_wait_seconds,
     sweeper_seats_expired_total,
 )
+from app.infra.redis import get_redis
 from app.infra.tables import SeatRow
+from app.realtime.pubsub import publish_seat_update
 
 log = structlog.get_logger(__name__)
 
@@ -181,7 +183,7 @@ async def sweep_once(session: AsyncSession, batch_size: int, now: datetime) -> S
     sweeper_lock_wait_seconds.observe(time.monotonic() - lock_start)
 
     rows = result.scalars().all()
-    expired_seat_ids: list[int] = []
+    expired_rows: list[SeatRow] = []
     for row in rows:
         seat = seat_to_domain(row)
         try:
@@ -193,7 +195,7 @@ async def sweep_once(session: AsyncSession, batch_size: int, now: datetime) -> S
             sweeper_illegal_transition_total.inc()
             continue
         seat_apply(row, expired_seat)
-        expired_seat_ids.append(row.id)
+        expired_rows.append(row)
 
     await session.commit()
 
@@ -201,11 +203,29 @@ async def sweep_once(session: AsyncSession, batch_size: int, now: datetime) -> S
     # docstring's ordering section. Each delete is independently best-
     # effort (app/infra/hold_cache.py never raises); one failing does not
     # stop the others.
-    for seat_id in expired_seat_ids:
-        await hold_cache.delete_hold_mirror(seat_id)
+    for row in expired_rows:
+        await hold_cache.delete_hold_mirror(row.id)
+
+    # Realtime fanout (Phase 7), same AFTER-commit ordering, same
+    # reasoning: a lost publish is a stale seat map that self-corrects
+    # on the client's next reconnect snapshot; a premature one would
+    # show a seat AVAILABLE before Postgres has actually agreed it is.
+    # event_id/section/version are already on `row` -- these are the
+    # exact rows just expired, no follow-up query needed.
+    redis_client = get_redis()
+    for row in expired_rows:
+        await publish_seat_update(
+            redis_client,
+            event_id=row.event_id,
+            section=row.section,
+            seat_id=row.id,
+            status=row.status,
+            hold_expires_at=row.hold_expires_at,
+            version=row.version,
+        )
 
     sweeper_batch_duration_seconds.observe(time.monotonic() - batch_start)
-    seats_expired = len(expired_seat_ids)
+    seats_expired = len(expired_rows)
     if seats_expired:
         sweeper_seats_expired_total.inc(seats_expired)
 

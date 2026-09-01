@@ -18,14 +18,17 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infra import hold_cache
 from app.infra.config import settings
 from app.infra.db import get_session
+from app.infra.redis import get_redis
 from app.infra.tables import SeatRow
 from app.inventory.strategies.base import SeatAcquisitionStrategy, get_strategy
+from app.realtime.pubsub import publish_seat_update
 
 router = APIRouter()
 
@@ -77,6 +80,33 @@ async def create_hold(
     # source of truth).
     for seat_id in result.acquired:
         await hold_cache.set_hold_mirror(seat_id, body.session_id, hold_expires_at, now)
+
+    # Realtime fanout (Phase 7): AFTER the strategy's own commit (every
+    # strategy.acquire() implementation commits internally), never
+    # before -- same ordering principle as the hold-mirror writes above.
+    # section+version aren't part of AcquireResult (touching that shape
+    # would mean touching all three strategies and their own test
+    # suites for a value only the realtime layer needs) -- one cheap
+    # follow-up SELECT instead.
+    if result.acquired:
+        acquired_rows = (
+            await session.execute(
+                select(SeatRow.id, SeatRow.section, SeatRow.version).where(
+                    SeatRow.id.in_(result.acquired)
+                )
+            )
+        ).all()
+        redis_client = get_redis()
+        for seat_id, section, version in acquired_rows:
+            await publish_seat_update(
+                redis_client,
+                event_id=body.event_id,
+                section=section,
+                seat_id=seat_id,
+                status="HELD",
+                hold_expires_at=hold_expires_at,
+                version=version,
+            )
 
     return HoldResponse(
         event_id=body.event_id,
@@ -149,9 +179,11 @@ async def extend_hold_at(
             SeatRow.hold_expires_at > now,
         )
         .values(hold_expires_at=new_hold_expires_at, version=SeatRow.version + 1, updated_at=now)
+        .returning(SeatRow.event_id, SeatRow.section, SeatRow.version)
     )
+    row = result.first()
 
-    if result.rowcount == 0:
+    if row is None:
         await session.rollback()
         return False
 
@@ -161,6 +193,24 @@ async def extend_hold_at(
     # docstring for why using duration here would expire the mirror
     # before the real (extended) hold actually ends.
     await hold_cache.set_hold_mirror(seat_id, session_id, new_hold_expires_at, now)
+
+    # Realtime fanout (Phase 7): AFTER commit. An extension doesn't
+    # change status, but it DOES change hold_expires_at, which is
+    # exactly what a viewer's countdown renders -- suppressing this
+    # publish because "status didn't change" would leave every watching
+    # client's timer silently wrong until the seat's next real status
+    # change. event_id/section/version come from the UPDATE's own
+    # RETURNING rather than a second query.
+    event_id, section, version = row
+    await publish_seat_update(
+        get_redis(),
+        event_id=event_id,
+        section=section,
+        seat_id=seat_id,
+        status="HELD",
+        hold_expires_at=new_hold_expires_at,
+        version=version,
+    )
     return True
 
 
