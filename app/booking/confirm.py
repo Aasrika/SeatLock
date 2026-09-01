@@ -69,6 +69,112 @@ async def load_booking(session: AsyncSession, booking_id: int) -> BookingRow | N
     ).scalar_one_or_none()
 
 
+async def attempt_confirm_write(
+    session: AsyncSession,
+    booking_id: int,
+    seat_ids: list[int],
+    session_id: str,
+    now: datetime,
+    *,
+    idempotency_key: str | None = None,
+) -> bool:
+    """The actual write, shared by confirm_booking_transaction (below,
+    the synchronous HTTP path) and workers/payment_worker.py (the
+    asynchronous webhook-driven path) -- both need EXACTLY this same
+    atomic transition and neither should reimplement it separately.
+    Callers still differ in what a False return MEANS (the route raises
+    ConfirmFailed for a clean 409; the payment worker treats it as the
+    late-success case, SPEC.md section 7), so this only performs the
+    write and reports success/failure -- it never raises for "the hold
+    was no longer valid," only for genuine unexpected DB errors.
+
+    `idempotency_key`: None for the payment-worker caller, which has no
+    client-supplied key to record -- BookingRow.idempotency_key is left
+    untouched in that case rather than cleared, since its own docstring
+    describes it as "whichever operation MOST RECENTLY wrote this row,"
+    and a webhook-driven confirm recording nothing is more honest than
+    recording a fabricated key.
+
+    One atomic conditional UPDATE, WHERE clause AND values mirroring
+    exactly what state_machine.confirm() validates for every seat (HELD,
+    held by THIS session, not expired -> BOOKED, booking_id set, hold
+    fields cleared) -- see optimistic.py's module docstring for why the
+    domain call and the raw UPDATE must agree on both the check and the
+    write. Rowcount less than requested means something changed between
+    the caller's read and this UPDATE -- roll back rather than partially
+    confirm, same all-or-nothing rule every multi-seat acquire in this
+    codebase follows. booking_id is set HERE, not at creation (see
+    BookingRow.seat_ids' docstring) -- this is the one place a seat's
+    booking_id legitimately becomes non-NULL while HELD... becoming
+    BOOKED in the same UPDATE, so check_state_coherence's HELD-implies-
+    no-booking_id rule is never observed to be violated, even
+    transiently.
+    """
+    result = await session.execute(
+        sa_update(SeatRow)
+        .where(
+            SeatRow.id.in_(seat_ids),
+            SeatRow.status == "HELD",
+            SeatRow.held_by_session_id == session_id,
+            SeatRow.hold_expires_at > now,
+        )
+        .values(
+            status="BOOKED",
+            version=SeatRow.version + 1,
+            held_by_session_id=None,
+            hold_expires_at=None,
+            booking_id=booking_id,
+            updated_at=now,
+        )
+    )
+    if result.rowcount != len(seat_ids):
+        await session.rollback()
+        return False
+
+    # First live firing point for oversell_blocked_total{layer="database"}
+    # (app/infra/metrics.py has documented it as dormant since Phase 1,
+    # waiting for exactly this insert to exist). This should NEVER raise
+    # in correct operation -- the conditional UPDATE above already
+    # guarantees these seats were exclusively HELD by this session the
+    # instant it ran -- but the partial unique index on booking_seats is
+    # the DB-level last line of defence SPEC.md section 3 specifies, and
+    # if it ever fires, application logic has a bug that let two bookings
+    # reach this point for the same seat.
+    try:
+        await session.execute(
+            insert(BookingSeatRow), [{"booking_id": booking_id, "seat_id": sid} for sid in seat_ids]
+        )
+    except IntegrityError:
+        await session.rollback()
+        oversell_blocked_total.labels(layer="database").inc()
+        return False
+
+    # Booking status update -- guarded by status='PENDING' too, defence
+    # in depth alongside the seat UPDATE's own guard above.
+    values: dict[str, object] = {"status": "CONFIRMED", "confirmed_at": now}
+    if idempotency_key is not None:
+        values["idempotency_key"] = idempotency_key
+    result = await session.execute(
+        sa_update(BookingRow)
+        .where(BookingRow.id == booking_id, BookingRow.status == "PENDING")
+        .values(**values)
+    )
+    if result.rowcount != 1:
+        await session.rollback()
+        return False
+
+    await session.execute(
+        insert(OutboxRow),
+        {
+            "aggregate_id": f"booking:{booking_id}",
+            "event_type": "booking.confirmed",
+            "payload": {"booking_id": booking_id, "seat_ids": seat_ids},
+            "created_at": now,
+        },
+    )
+    return True
+
+
 async def confirm_booking_transaction(
     session: AsyncSession, booking_id: int, session_id: str, idempotency_key: str, now: datetime
 ) -> BookingResponse:
@@ -98,81 +204,11 @@ async def confirm_booking_transaction(
     except IllegalBookingTransition as exc:
         raise ConfirmFailed(f"booking_confirm_rejected: {exc}") from exc
 
-    # The actual write: one atomic conditional UPDATE, WHERE clause AND
-    # values mirroring exactly what state_machine.confirm() just
-    # validated for every seat (HELD, held by THIS session, not expired
-    # -> BOOKED, booking_id set, hold fields cleared). Rowcount less than
-    # requested means something changed between the read above and this
-    # UPDATE -- roll back rather than partially confirm, same
-    # all-or-nothing rule every multi-seat acquire in this codebase
-    # follows. booking_id is set HERE, not at creation (see BookingRow.
-    # seat_ids' docstring) -- this is the one place a seat's booking_id
-    # legitimately becomes non-NULL while HELD... becoming BOOKED in the
-    # same UPDATE, so check_state_coherence's HELD-implies-no-booking_id
-    # rule is never observed to be violated, even transiently.
-    result = await session.execute(
-        sa_update(SeatRow)
-        .where(
-            SeatRow.id.in_(seat_ids),
-            SeatRow.status == "HELD",
-            SeatRow.held_by_session_id == session_id,
-            SeatRow.hold_expires_at > now,
-        )
-        .values(
-            status="BOOKED",
-            version=SeatRow.version + 1,
-            held_by_session_id=None,
-            hold_expires_at=None,
-            booking_id=booking_id,
-            updated_at=now,
-        )
+    ok = await attempt_confirm_write(
+        session, booking_id, seat_ids, session_id, now, idempotency_key=idempotency_key
     )
-    if result.rowcount != len(seat_ids):
-        await session.rollback()
+    if not ok:
         raise ConfirmFailed("hold_no_longer_valid")
-
-    # First live firing point for oversell_blocked_total{layer="database"}
-    # (app/infra/metrics.py has documented it as dormant since Phase 1,
-    # waiting for exactly this insert to exist). This should NEVER raise
-    # in correct operation -- the conditional UPDATE above already
-    # guarantees these seats were exclusively HELD by this session the
-    # instant it ran -- but the partial unique index on booking_seats is
-    # the DB-level last line of defence SPEC.md section 3 specifies, and
-    # if it ever fires, application logic has a bug that let two bookings
-    # reach this point for the same seat.
-    try:
-        await session.execute(
-            insert(BookingSeatRow), [{"booking_id": booking_id, "seat_id": sid} for sid in seat_ids]
-        )
-    except IntegrityError as exc:
-        await session.rollback()
-        oversell_blocked_total.labels(layer="database").inc()
-        raise ConfirmFailed("oversell_blocked_at_database_layer") from exc
-
-    # Booking status update -- guarded by status='PENDING' too, defence
-    # in depth alongside the seat UPDATE's own guard above. Also
-    # overwrites idempotency_key: this booking's row now records the KEY
-    # OF THIS CONFIRM CALL, not creation's original key -- see
-    # BookingRow.idempotency_key's own docstring for why that overwrite
-    # is exactly what workers/idempotency_reaper.py needs.
-    result = await session.execute(
-        sa_update(BookingRow)
-        .where(BookingRow.id == booking_id, BookingRow.status == "PENDING")
-        .values(status="CONFIRMED", confirmed_at=now, idempotency_key=idempotency_key)
-    )
-    if result.rowcount != 1:
-        await session.rollback()
-        raise ConfirmFailed("booking_no_longer_pending")
-
-    await session.execute(
-        insert(OutboxRow),
-        {
-            "aggregate_id": f"booking:{booking_id}",
-            "event_type": "booking.confirmed",
-            "payload": {"booking_id": booking_id, "seat_ids": seat_ids},
-            "created_at": now,
-        },
-    )
 
     confirmed = await load_booking(session, booking_id)
     assert confirmed is not None  # just updated it in this same transaction

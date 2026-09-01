@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.api.routes import admin, booking, bookings, metrics
+from app.api.routes import admin, booking, bookings, metrics, webhooks
 from app.infra.config import settings
 from app.infra.db import engine
 from app.infra.redis import get_redis
@@ -41,6 +41,7 @@ app = FastAPI(title="Seatlock", lifespan=lifespan)
 
 app.include_router(booking.router, prefix="/api", tags=["booking"])
 app.include_router(bookings.router, prefix="/api", tags=["bookings"])
+app.include_router(webhooks.router, prefix="/api", tags=["webhooks"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(metrics.router, tags=["metrics"])
 
