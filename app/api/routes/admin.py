@@ -34,6 +34,21 @@ from app.domain.invariants import (
 )
 from app.infra.db import get_session
 from app.infra.mappers import seat_to_domain
+
+# CollectorRegistry/multiprocess via app.infra.metrics, NOT a fresh
+# `from prometheus_client import ...` here -- that module sets
+# PROMETHEUS_MULTIPROC_DIR before ITS OWN prometheus_client import, and
+# prometheus_client decides in-process-vs-multiprocess mode once, at its
+# first import in the whole process, never revisited (see that module's
+# docstring). This router is the first thing app/main.py imports (`from
+# app.api.routes import admin, booking, ...`); a direct prometheus_client
+# import here would race that env var and could lose, silently putting
+# every metric in the API -- not just this endpoint's own reads -- into
+# in-process-only mode. Importing these two names FROM metrics.py instead
+# forces its module body (including the env var) to run first, since
+# Python must finish executing a module before any of its names are
+# importable elsewhere.
+from app.infra.metrics import CollectorRegistry, multiprocess
 from app.infra.tables import BookingSeatRow, EventRow, HoldAuditRow, SeatRow
 
 router = APIRouter()
@@ -58,14 +73,13 @@ async def _get_event_or_404(session: AsyncSession, event_id: int) -> EventRow:
     return event
 
 
-@router.get("/invariants", response_model=InvariantsResponse)
-async def get_invariants(
-    event_id: int, session: Annotated[AsyncSession, Depends(get_session)]
-) -> InvariantsResponse:
-    event = await _get_event_or_404(session, event_id)
-
+async def _compute_invariants(session: AsyncSession, event: EventRow) -> dict[str, InvariantResult]:
+    """Shared by GET /invariants and GET /dashboard -- both need exactly
+    this same per-event check, and duplicating it would risk the two
+    silently diverging over time.
+    """
     seat_rows = (
-        (await session.execute(select(SeatRow).where(SeatRow.event_id == event_id))).scalars().all()
+        (await session.execute(select(SeatRow).where(SeatRow.event_id == event.id))).scalars().all()
     )
     seats = [seat_to_domain(row) for row in seat_rows]
 
@@ -74,7 +88,7 @@ async def get_invariants(
             await session.execute(
                 select(BookingSeatRow.seat_id)
                 .join(SeatRow, SeatRow.id == BookingSeatRow.seat_id)
-                .where(SeatRow.event_id == event_id, BookingSeatRow.released_at.is_(None))
+                .where(SeatRow.event_id == event.id, BookingSeatRow.released_at.is_(None))
             )
         )
         .scalars()
@@ -96,6 +110,15 @@ async def get_invariants(
     run_check("no_double_booking", lambda: check_no_double_booking(seats))
     run_check("state_coherence", lambda: check_state_coherence(seats))
     run_check("booking_linkage", lambda: check_booking_linkage(seats, active_seat_ids))
+    return results
+
+
+@router.get("/invariants", response_model=InvariantsResponse)
+async def get_invariants(
+    event_id: int, session: Annotated[AsyncSession, Depends(get_session)]
+) -> InvariantsResponse:
+    event = await _get_event_or_404(session, event_id)
+    results = await _compute_invariants(session, event)
 
     return InvariantsResponse(
         event_id=event_id,
@@ -208,4 +231,127 @@ async def get_seat_status_counts(
         available=counts.get("AVAILABLE", 0),
         held=counts.get("HELD", 0),
         booked=counts.get("BOOKED", 0),
+    )
+
+
+def _collect_samples() -> list:
+    """Reads the SAME aggregated multiprocess registry GET /metrics
+    exposes (app/infra/metrics.py's render_metrics_text) -- just as
+    structured Sample objects instead of Prometheus text, so the values
+    below are typed and shaped here, once, rather than left for the
+    frontend to parse out of a text format that exists to talk to
+    Prometheus, not to a UI (see the review comment this endpoint
+    responds to: a metric rename or a multiprocess_mode change would
+    silently break a text-parsing frontend with no type error and no
+    failing test -- exactly the class of stale-definition bug this
+    project has already found five times).
+
+    Flattened across families, keyed by nothing -- deliberately, NOT a
+    dict keyed by family name. Every Counter in this codebase is
+    constructed with its name ALREADY ending in "_total" (e.g.
+    "deadlocks_total"); prometheus_client strips that suffix from the
+    FAMILY name internally and re-adds it only on the SAMPLE name (the
+    same quirk this codebase's own test helpers already work around --
+    see e.g. test_optimistic.py's `_counter_value`). Filtering by
+    `sample.name` directly below sidesteps needing to replicate that
+    stripping logic here too.
+    """
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    return [sample for family in registry.collect() for sample in family.samples]
+
+
+def _gauge_value(samples: list, metric_name: str) -> float:
+    for sample in samples:
+        if sample.name == metric_name:
+            return sample.value
+    return 0.0
+
+
+def _counter_total(samples: list, metric_name: str) -> float:
+    """`metric_name` is the counter's OWN construction name, already
+    ending in "_total" -- that is also the exposed sample name (see
+    _collect_samples' docstring), so no suffix manipulation happens
+    here. Sums across every label combination; callers that need a
+    per-label breakdown use _counter_by_label instead.
+    """
+    return sum(sample.value for sample in samples if sample.name == metric_name)
+
+
+def _counter_by_label(samples: list, metric_name: str, label: str) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for sample in samples:
+        if sample.name == metric_name and label in sample.labels:
+            key = sample.labels[label]
+            result[key] = result.get(key, 0.0) + sample.value
+    return result
+
+
+def _histogram_count_and_sum(samples: list, metric_name: str) -> tuple[float, float]:
+    count = sum(sample.value for sample in samples if sample.name == f"{metric_name}_count")
+    total = sum(sample.value for sample in samples if sample.name == f"{metric_name}_sum")
+    return count, total
+
+
+class DashboardMetrics(BaseModel):
+    sweeper_backlog: float
+    lock_wait_seconds_count: float
+    lock_wait_seconds_sum: float
+    deadlocks_total: float
+    lock_timeouts_total: float
+    optimistic_conflicts_total: float
+    optimistic_retries_total: float
+    optimistic_exhausted_total: float
+    reconciliation_divergence_by_kind: dict[str, float]
+    reconciliation_transient_by_kind: dict[str, float]
+
+
+class DashboardResponse(BaseModel):
+    checked_at: datetime
+    event_id: int | None
+    invariants: dict[str, InvariantResult] | None
+    metrics: DashboardMetrics
+
+
+@router.get("/dashboard", response_model=DashboardResponse)
+async def get_dashboard(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    event_id: int | None = None,
+) -> DashboardResponse:
+    """SPEC.md section 9's admin dashboard: live invariant status,
+    sweeper backlog, lock contention, retry rates, reconciliation
+    divergences -- one typed, tested response, not a frontend parsing
+    Prometheus text (see _collect_metric_families' docstring for why).
+
+    `invariants` is only populated when `event_id` is given -- it is the
+    one genuinely per-event piece of this response; sweeper/lock/retry/
+    reconciliation metrics are system-wide regardless of which event a
+    viewer happens to have open.
+    """
+    invariants: dict[str, InvariantResult] | None = None
+    if event_id is not None:
+        event = await _get_event_or_404(session, event_id)
+        invariants = await _compute_invariants(session, event)
+
+    samples = _collect_samples()
+    lock_wait_count, lock_wait_sum = _histogram_count_and_sum(samples, "lock_wait_seconds")
+    metrics = DashboardMetrics(
+        sweeper_backlog=_gauge_value(samples, "sweeper_backlog"),
+        lock_wait_seconds_count=lock_wait_count,
+        lock_wait_seconds_sum=lock_wait_sum,
+        deadlocks_total=_counter_total(samples, "deadlocks_total"),
+        lock_timeouts_total=_counter_total(samples, "lock_timeouts_total"),
+        optimistic_conflicts_total=_counter_total(samples, "optimistic_conflicts_total"),
+        optimistic_retries_total=_counter_total(samples, "optimistic_retries_total"),
+        optimistic_exhausted_total=_counter_total(samples, "optimistic_exhausted_total"),
+        reconciliation_divergence_by_kind=_counter_by_label(
+            samples, "reconciliation_divergence_total", "kind"
+        ),
+        reconciliation_transient_by_kind=_counter_by_label(
+            samples, "reconciliation_transient_total", "kind"
+        ),
+    )
+
+    return DashboardResponse(
+        checked_at=datetime.now(UTC), event_id=event_id, invariants=invariants, metrics=metrics
     )
