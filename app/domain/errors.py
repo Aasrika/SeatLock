@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from app.domain.models import SeatStatus
+    from app.domain.models import BookingStatus, SeatStatus
 
 
 class DomainError(Exception):
@@ -87,3 +87,24 @@ class InvariantViolation(DomainError):
     """A system-wide invariant (I1, I2, or state coherence) does not hold
     over a given seat snapshot. See app/domain/invariants.py.
     """
+
+
+class IllegalBookingTransition(DomainError):
+    """A booking_state_machine.py function was called on a booking in an
+    unsupported status. The booking-level sibling of IllegalTransition
+    above -- kept as a separate type rather than reusing IllegalTransition
+    (whose fields/message are seat-shaped: seat_id, SeatStatus) because a
+    booking and a seat are different aggregates with different id spaces,
+    and conflating their exceptions would make a caller's `except` clause
+    ambiguous about which kind of illegal transition it just caught.
+    """
+
+    def __init__(
+        self, booking_id: int, from_status: BookingStatus, to_status: BookingStatus
+    ) -> None:
+        self.booking_id = booking_id
+        self.from_status = from_status
+        self.to_status = to_status
+        super().__init__(
+            f"Booking {booking_id}: cannot transition from {from_status.value} to {to_status.value}"
+        )

@@ -4,15 +4,15 @@ This is a SEPARATE representation from app/domain/'s pure dataclasses --
 they are related only through the explicit conversions in
 app/infra/mappers.py. Nothing here may be imported by app/domain/.
 
-Only the four Phase 0 tables: events, seats, bookings, booking_seats.
-idempotency_keys, payment_events, and outbox belong to Phase 5 -- do not
-add them here.
+The four Phase 0 tables (events, seats, bookings, booking_seats) plus
+Phase 5's idempotency_keys, payment_events, and outbox.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -29,6 +29,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # This naming convention must exist before the first migration is
@@ -130,6 +131,20 @@ class BookingRow(Base):
     # VARCHAR, not CHAR: Postgres blank-pads CHAR(n), which produces
     # surprising trailing-space behaviour on comparison and export.
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    # Filed in Phase 0 as "a lookup aid only" (see the old comment this one
+    # replaces) -- turns out to be load-bearing for crash recovery instead
+    # (Phase 5): it always holds the Idempotency-Key of whichever operation
+    # (create or confirm) most recently wrote this row, overwritten by each
+    # subsequent operation. app/infra/idempotency.py's own idempotency_keys
+    # table is the actual dedup/response-cache mechanism and the source of
+    # truth for a key's status; THIS column is what workers/
+    # idempotency_reaper.py joins back through when it finds a stale
+    # IN_PROGRESS row -- if a booking already exists carrying that key, the
+    # booking write itself succeeded and only the completion marker was
+    # lost (e.g. a crash after commit), so the reaper recovers COMPLETED
+    # from the booking's own current state rather than wrongly marking a
+    # successful operation FAILED (which would let a client retry and
+    # double-book). See idempotency_reaper.py's module docstring.
     idempotency_key: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -138,12 +153,25 @@ class BookingRow(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('PENDING', 'CONFIRMED', 'CANCELLED', 'REFUNDED')",
+            "status IN ('PENDING', 'CONFIRMED', 'CANCELLED', 'REFUNDED', 'REFUND_REQUIRED')",
             name="booking_status_valid",
         ),
-        # Non-unique -- the real dedup guarantee lives in Phase 5's
-        # idempotency_keys table. This is a lookup aid only.
-        Index(None, "idempotency_key"),
+        # Unique (Phase 5, was a non-unique lookup index in Phase 0): now
+        # that idempotency_reaper.py relies on "at most one booking per
+        # key" to recover cleanly, two bookings silently sharing a key
+        # would make that recovery lookup ambiguous. Partial, WHERE NOT
+        # NULL: Postgres's plain unique indexes already never treat two
+        # NULLs as colliding, so this WHERE clause changes nothing about
+        # actual behaviour -- it is here so a future reader doesn't need
+        # to already know that Postgres default in order to see that
+        # bookings created outside the idempotency path (idempotency_key
+        # left NULL) are deliberately, not accidentally, exempt here.
+        Index(
+            None,
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
     )
 
 
@@ -203,3 +231,116 @@ class HoldAuditRow(Base):
     acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (Index(None, "seat_id"),)
+
+
+class IdempotencyKeyRow(Base):
+    """SPEC.md section 6. The dedup/response-cache mechanism for any
+    endpoint that mutates money-adjacent state (POST /api/bookings, POST
+    /api/bookings/{id}/confirm) -- see app/infra/idempotency.py for the
+    four-case flow this table drives, and workers/idempotency_reaper.py
+    for what happens to a row that never leaves IN_PROGRESS.
+    """
+
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    response_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    response_body: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    # Not a TTL on the KEY's dedup guarantee (that lasts as long as the row
+    # exists) -- this is when the row becomes eligible for cleanup/deletion
+    # by some future retention job. No such job exists yet in this phase;
+    # the column ships now because SPEC.md section 3 specifies it as part
+    # of this table's shape.
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED')", name="idempotency_key_status_valid"
+        ),
+        # workers/idempotency_reaper.py's own query: find IN_PROGRESS rows
+        # older than a timeout. Partial so the index only covers rows that
+        # could possibly be stale -- COMPLETED/FAILED rows, the eventual
+        # majority, never enter it.
+        Index(None, "created_at", postgresql_where=text("status = 'IN_PROGRESS'")),
+    )
+
+
+class PaymentEventRow(Base):
+    """SPEC.md section 7. provider_event_id is the primary key on purpose
+    (not a separate surrogate id) -- the dedup guarantee this table exists
+    for IS "insert once per provider_event_id, ever", so making that value
+    the actual primary key means Postgres's own unique-violation error is
+    the dedup check; there is no separate query to get it wrong or skip.
+    """
+
+    __tablename__ = "payment_events"
+
+    provider_event_id: Mapped[str] = mapped_column(String, primary_key=True)
+    # Nullable, ON DELETE SET NULL: a webhook whose payload names a
+    # booking_id that does not (or no longer) exists must still be
+    # insertable -- see app/payments/webhook.py's UNRESOLVED handling.
+    # Rejecting the INSERT outright would mean returning something other
+    # than 200 for a legitimate provider event, which is exactly the
+    # retry-storm failure mode this table's whole design exists to avoid.
+    booking_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True
+    )
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # NULL until the webhook route's own INSERT decides it: 'UNRESOLVED'
+    # immediately (booking_id didn't resolve, nothing for a worker to act
+    # on), otherwise NULL/pending until workers/payment_worker.py processes
+    # it and sets a terminal value ('APPLIED', 'REJECTED', 'ERROR').
+    processing_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    __table_args__ = (
+        Index(None, "booking_id"),
+        # workers/payment_worker.py's queue query: unprocessed events,
+        # oldest first. Partial for the same reason as the idempotency
+        # reaper's index above -- most rows are done and should never be
+        # rescanned.
+        Index(None, "received_at", postgresql_where=text("processed_at IS NULL")),
+    )
+
+
+class OutboxRow(Base):
+    """SPEC.md section 3 ("outbox (Phase 5+)"). Transactional-outbox
+    pattern: a row is written here in the SAME transaction as whatever
+    booking-status change it describes (confirm, late-success
+    refund-required, webhook-driven refund -- see app/booking/confirm.py
+    and workers/payment_worker.py), so the event is durable the instant
+    the state change is, with no separate commit to lose.
+
+    No publisher/consumer exists yet in this phase -- that is
+    app/realtime/'s future job (SPEC.md section 5 mentions the sweeper
+    "publishing release events" with the same scope note: out of scope
+    until whichever phase builds that layer). Shipping the durable-write
+    half now, unconsumed, is still correct: published_at simply never
+    leaves NULL until a consumer exists to set it.
+    """
+
+    __tablename__ = "outbox"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    # Free-text "type:id" (e.g. "booking:123"), not a FK -- the outbox is
+    # deliberately generic across aggregate types, and a future non-booking
+    # event source should not require a schema change here to participate.
+    aggregate_id: Mapped[str] = mapped_column(String, nullable=False)
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (Index(None, "created_at", postgresql_where=text("published_at IS NULL")),)

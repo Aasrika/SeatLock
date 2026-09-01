@@ -36,6 +36,13 @@ class BookingStatus(StrEnum):
     CONFIRMED = "CONFIRMED"
     CANCELLED = "CANCELLED"
     REFUNDED = "REFUNDED"
+    # Phase 5: a payment.succeeded webhook arrived for a booking whose hold
+    # had already expired and been resold to someone else. The booking can
+    # never become CONFIRMED (that seat belongs to a different booking now)
+    # but the customer's money still needs to move -- see
+    # app/domain/booking_state_machine.py's require_refund() and SPEC.md
+    # section 7's "late-success case". Terminal, like CANCELLED/REFUNDED.
+    REFUND_REQUIRED = "REFUND_REQUIRED"
 
 
 @dataclass(frozen=True, slots=True)
