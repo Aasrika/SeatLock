@@ -15,21 +15,22 @@ reasoning as test_optimistic.py's own metric assertions).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import insert
+from sqlalchemy import insert, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
-from app.api.routes.admin import get_dashboard, get_invariants
+from app.api.routes.admin import _compute_invariants, get_dashboard, get_invariants
 from app.infra.metrics import (
     deadlocks_total,
     optimistic_conflicts_total,
     reconciliation_divergence_total,
     sweeper_backlog_gauge,
 )
-from app.infra.tables import EventRow, SeatRow
+from app.infra.tables import BookingRow, BookingSeatRow, EventRow, SeatRow
 
 NOW = datetime.now(UTC)
 
@@ -156,3 +157,144 @@ class TestDashboardInvariantsPerEvent:
             standalone = await get_invariants(event_id, session)
 
         assert dashboard.invariants == standalone.results
+
+
+class TestInvariantsReadSnapshotConsistency:
+    """Phase 8a's chaos suite caught _compute_invariants reporting a
+    false booking_linkage violation under real sustained load: it reads
+    `seats` and `booking_seats` as two SEPARATE statements, and Postgres's
+    default READ COMMITTED isolation gives each statement its own
+    snapshot, not the whole transaction. A booking confirm's single
+    atomic commit (both tables, together) landing BETWEEN those two reads
+    produces a torn cross-section -- the OLD seats snapshot (still HELD)
+    alongside the NEW booking_seats snapshot (already active). Fixed by
+    giving _compute_invariants its own REPEATABLE READ session, which
+    fixes the snapshot at the first statement regardless of what commits
+    elsewhere in between.
+
+    Reproducing the exact race deterministically in one shot would need
+    a way to pause _compute_invariants between its two reads -- not
+    something worth adding a test-only hook for. Instead: hammer the
+    actual race window many times (a real confirm-shaped toggle,
+    committing repeatedly, concurrently with many _compute_invariants
+    calls) and assert zero false violations across all of them -- the
+    same "run it enough times that a probabilistic race would have to
+    show up" discipline this project already applies to its concurrency
+    tests (SPEC.md section 10, Layer 3).
+    """
+
+    async def test_concurrent_confirm_toggle_never_produces_a_torn_read(self, session_factory):
+        async with session_factory() as session:
+            event_id = (
+                await session.execute(
+                    insert(EventRow).returning(EventRow.id),
+                    {
+                        "name": "Snapshot Consistency Test",
+                        "venue": "Test Venue",
+                        "starts_at": NOW,
+                        "total_seats": 1,
+                    },
+                )
+            ).scalar_one()
+            seat_id = (
+                await session.execute(
+                    insert(SeatRow).returning(SeatRow.id),
+                    {
+                        "event_id": event_id,
+                        "section": "A",
+                        "row_label": "1",
+                        "seat_number": 1,
+                        "status": "HELD",
+                        "held_by_session_id": "s1",
+                        "hold_expires_at": NOW + timedelta(minutes=5),
+                        "version": 0,
+                    },
+                )
+            ).scalar_one()
+            booking_id = (
+                await session.execute(
+                    insert(BookingRow).returning(BookingRow.id),
+                    {
+                        "event_id": event_id,
+                        "user_id": 1,
+                        "session_id": "s1",
+                        "status": "CONFIRMED",
+                        "total_amount": "42.00",
+                        "currency": "USD",
+                        "seat_ids": [seat_id],
+                    },
+                )
+            ).scalar_one()
+            await session.execute(
+                insert(BookingSeatRow),
+                {"booking_id": booking_id, "seat_id": seat_id, "released_at": NOW},
+            )
+            await session.commit()
+            event = await session.get(EventRow, event_id)
+
+        stop = asyncio.Event()
+
+        async def toggle_confirm_state_repeatedly() -> None:
+            # Both tables, one commit each time -- the exact shape a real
+            # confirm produces (app/api/routes/bookings.py's
+            # confirm_booking_transaction, single commit).
+            booked = True
+            while not stop.is_set():
+                async with session_factory() as toggle_session:
+                    if booked:
+                        # Going TO booked: active booking_seats row (NULL
+                        # released_at) together with status=BOOKED.
+                        await toggle_session.execute(
+                            update(SeatRow)
+                            .where(SeatRow.id == seat_id)
+                            .values(
+                                status="BOOKED",
+                                booking_id=booking_id,
+                                held_by_session_id=None,
+                                hold_expires_at=None,
+                            )
+                        )
+                        await toggle_session.execute(
+                            update(BookingSeatRow)
+                            .where(BookingSeatRow.seat_id == seat_id)
+                            .values(released_at=None)
+                        )
+                    else:
+                        # Going TO held (not booked): the booking_seats
+                        # row is released together with status=HELD.
+                        await toggle_session.execute(
+                            update(SeatRow)
+                            .where(SeatRow.id == seat_id)
+                            .values(
+                                status="HELD",
+                                booking_id=None,
+                                held_by_session_id="s1",
+                                hold_expires_at=NOW + timedelta(minutes=5),
+                            )
+                        )
+                        await toggle_session.execute(
+                            update(BookingSeatRow)
+                            .where(BookingSeatRow.seat_id == seat_id)
+                            .values(released_at=NOW)
+                        )
+                    await toggle_session.commit()
+                booked = not booked
+                await asyncio.sleep(0)
+
+        toggle_task = asyncio.create_task(toggle_confirm_state_repeatedly())
+        try:
+            violations = []
+            for _ in range(200):
+                async with session_factory() as session:
+                    results = await _compute_invariants(session, event)
+                if not results["booking_linkage"].passed:
+                    violations.append(results["booking_linkage"].detail)
+        finally:
+            stop.set()
+            await toggle_task
+
+        assert violations == [], (
+            "REPEATABLE READ should make a torn cross-section between the seats and "
+            "booking_seats reads impossible, regardless of how many confirm-shaped "
+            f"commits land concurrently -- got {len(violations)} false violation(s)"
+        )

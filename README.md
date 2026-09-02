@@ -152,11 +152,17 @@ purpose) under real concurrent load, and checks all five invariants the
 whole time. All three passed with zero invariant violations; holds and
 confirms kept succeeding throughout every one of them, on Postgres
 alone. The same document also killed the sweeper outright to test I3's
-own "cleanup, not mechanism" claim, killed one of four API workers
-mid-transaction, and restarted Postgres mid-load — the last of those
-found and fixed two real bugs (a missing Redis timeout, and three
-distinct ways a Postgres restart could surface as a bare 500 instead of
-503) rather than just confirming the design worked.
+own "cleanup, not mechanism" claim (uncontended seats it reclaims stayed
+correctly reclaimed even with the sweeper dead), killed one of four API
+workers mid-transaction — plus a follow-up variant that specifically
+holds row locks across the kill — and restarted Postgres mid-load. Six
+real bugs were found and fixed along the way, not just documented: a
+missing Redis timeout, three distinct ways a Postgres restart could
+surface as a bare 500 instead of 503, a metrics gauge that went blind
+at exactly the moment it was needed most, and a false invariant
+violation from the checker's own read-consistency gap under load. One
+Postgres setting
+(`idle_in_transaction_session_timeout`) was added as a direct result.
 
 ---
 

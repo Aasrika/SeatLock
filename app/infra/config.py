@@ -18,6 +18,37 @@ class Settings(BaseSettings):
     postgres_port: int = 5432
     database_url: str = "postgresql+asyncpg://seatlock:seatlock_local_dev@localhost:5432/seatlock"
 
+    # Postgres session-level GUC, set on every connection this app's own
+    # engine opens (app/infra/db.py, via asyncpg's server_settings) --
+    # NOT a cluster-wide postgresql.conf change, deliberately: a slow but
+    # legitimate Alembic migration or a testcontainers session must not
+    # get killed by a timeout scoped to the API/worker connection pool.
+    #
+    # Phase 8a's chaos suite (scenario e, api_worker_killed) passed
+    # WITHOUT this setting -- but only because this codebase's
+    # transactions are all short (a row lock held for a handful of
+    # milliseconds). That is not a general guarantee: a worker
+    # hard-killed mid-transaction leaves Postgres holding a connection
+    # that is idle in transaction FOREVER from Postgres's point of view --
+    # there was no clean disconnect, the socket simply stopped responding,
+    # and Postgres has no way to distinguish "client is thinking" from
+    # "client is dead" except a timeout. Without one, resolution falls
+    # back to the OS's TCP keepalive defaults, which are on the order of
+    # TWO HOURS -- during which every row lock that transaction held
+    # (e.g. every seat in a multi-seat hold) blocks every other booking
+    # attempt on those exact seats.
+    #
+    # 5000ms: every real transaction in this codebase (SELECT ... FOR
+    # UPDATE, the optimistic conditional UPDATE, a booking confirm) is
+    # sub-100ms end to end -- 5s is generous headroom against real work,
+    # while being a ~1400x tighter bound than the TCP keepalive fallback
+    # it replaces. See loadtest/chaos/scenarios/
+    # api_worker_killed_holding_lock.py for the scenario that opens a
+    # transaction, holds it well past this timeout, hard-kills the
+    # process holding it, and asserts the lock is released within this
+    # bound rather than indefinitely.
+    idle_in_transaction_session_timeout_ms: int = 5000
+
     redis_url: str = "redis://localhost:6379/0"
     # Bounds on every Redis command/connection this process issues.
     # UNCONFIGURED, these are unbounded -- and a paused (not killed) Redis

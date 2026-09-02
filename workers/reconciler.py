@@ -89,6 +89,7 @@ from app.infra.db import async_session_factory
 from app.infra.metrics import reconciliation_divergence_total, reconciliation_transient_total
 from app.infra.redis import get_redis
 from app.infra.tables import SeatRow
+from workers.sweeper import measure_backlog
 
 log = structlog.get_logger(__name__)
 
@@ -300,6 +301,20 @@ async def run_forever(interval_seconds: float, stop_event: asyncio.Event) -> Non
         now = datetime.now(UTC)
         async with async_session_factory() as session:
             result = await reconcile_once(session, now)
+            # Phase 8a's chaos suite (loadtest/chaos/scenarios/
+            # sweeper_killed.py) found sweeper_backlog_gauge's blind spot:
+            # it was only ever written by workers/sweeper.py's own loop,
+            # so killing the sweeper didn't just stop it draining the
+            # backlog -- it stopped the MEASUREMENT too, freezing the one
+            # signal meant to reveal the sweeper is gone. measure_backlog()
+            # was already written to be meaningful called independently
+            # (see its own docstring); calling it here, from a completely
+            # separate process on its own schedule, means the gauge keeps
+            # reflecting reality even if the sweeper itself is dead --
+            # multiprocess_mode="mostrecent" is exactly "whichever process
+            # last measured wins," which is what makes two independent
+            # writers to the same gauge correct rather than a race.
+            await measure_backlog(session, now)
         if result.total_divergences or result.total_transient:
             log.info(
                 "reconciler.pass",

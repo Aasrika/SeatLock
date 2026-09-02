@@ -138,6 +138,25 @@ def pid_is_running(pid: int) -> bool:
     return psutil.pid_exists(pid)
 
 
+def suspend_pid(pid: int) -> None:
+    """Freeze a process WITHOUT killing it (NtSuspendProcess on Windows,
+    SIGSTOP on POSIX, both via psutil) -- the process-level analogue of
+    docker_pause, and the one that actually reproduces "the socket
+    simply stops, no clean disconnect": killing a process (even hard)
+    lets the OS clean up its open file descriptors, including sockets,
+    on the way out -- the kernel sends the peer a normal close, and
+    Postgres notices almost immediately. A SUSPENDED process's socket is
+    still open and registered with the OS, but nothing is left running
+    to ever use it -- indistinguishable, from Postgres's side, from a
+    network partition or a frozen host. Confirmed directly while
+    building loadtest/chaos/scenarios/api_worker_killed_holding_lock.py:
+    killing the lock-holder released its row lock in well under a
+    second, not anywhere near idle_in_transaction_session_timeout --
+    that first result is what led to adding this function.
+    """
+    psutil.Process(pid).suspend()
+
+
 def count_live_children(master_pid: int) -> int:
     """How many live child processes `master_pid` currently has -- used
     as a best-effort "worker count" data point (before/after a kill),

@@ -25,12 +25,14 @@ import argparse
 import asyncio
 import contextlib
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
+import psutil
 from sqlalchemy import select, text
 
 from app.infra.config import settings
@@ -41,6 +43,7 @@ from loadtest.chaos import actions
 from loadtest.chaos.harness import ChaosInfra, ScenarioReport
 from loadtest.chaos.scenarios import (
     api_worker_killed,
+    api_worker_killed_holding_lock,
     postgres_restarted,
     redis_killed,
     redis_killed_restarted_empty,
@@ -72,8 +75,23 @@ SCENARIOS: dict[str, Any] = {
     "redis_paused": redis_paused,
     "redis_killed_restarted_empty": redis_killed_restarted_empty,
     "sweeper_killed": sweeper_killed,
-    "api_worker_killed": api_worker_killed,
+    "api_worker_killed_holding_lock": api_worker_killed_holding_lock,
     "postgres_restarted": postgres_restarted,
+    # LAST, deliberately: confirmed directly, repeatedly, that
+    # api_worker_killed's hard kill of one uvicorn worker can leave an
+    # orphaned replacement worker process behind despite three layers of
+    # cleanup (with_suppress_stop's pre-kill child capture, a pid-scoped
+    # sweep for orphans with no live parent to walk from, and repeating
+    # that sweep for several seconds to catch a late-arriving one) --
+    # see docs/chaos-results.md for the full account. Ordering this
+    # scenario last means nothing else in a full `make chaos` run ever
+    # needs start_infra() to succeed after it, which is the actual
+    # failure mode every occurrence has been: the NEXT scenario's fresh
+    # PROMETHEUS_MULTIPROC_DIR clear failing on a file an orphan still
+    # holds open. This does not fix the orphaning itself -- it makes the
+    # one thing this suite is actually deliverable on (`make chaos`
+    # completing all scenarios) robust by construction instead.
+    "api_worker_killed": api_worker_killed,
 }
 
 
@@ -129,24 +147,45 @@ async def reset_and_seed_chaos_event() -> tuple[int, list[int]]:
 
 
 def start_reconciler(
-    *, interval_seconds: float, confirm_delay_seconds: float
+    *, interval_seconds: float, confirm_delay_seconds: float, prometheus_multiproc_dir: str
 ) -> subprocess.Popen[bytes]:
+    # PROMETHEUS_MULTIPROC_DIR must match api_proc's -- prometheus_client's
+    # multiprocess mode aggregates by reading every per-PID .db file in
+    # ONE shared directory (app/infra/metrics.py's own module docstring).
+    # Without this, the reconciler's own measure_backlog() call (added
+    # specifically so sweeper_backlog_gauge survives the sweeper's death
+    # -- see workers/reconciler.py's comment) writes into whatever
+    # directory Settings.prometheus_multiproc_dir defaults to, NOT the
+    # chaos suite's dedicated one -- the API's /metrics scrape never sees
+    # it, and the gauge looks frozen at 0.0 even though the reconciler is
+    # measuring correctly. Confirmed directly: this omission is exactly
+    # why sweeper_killed's re-run first failed after the fix was added
+    # everywhere except here.
     env = {
         **os.environ,
         "RECONCILER_INTERVAL_SECONDS": str(interval_seconds),
         "RECONCILER_CONFIRM_DELAY_SECONDS": str(confirm_delay_seconds),
+        "PROMETHEUS_MULTIPROC_DIR": prometheus_multiproc_dir,
     }
     proc = subprocess.Popen([sys.executable, "-m", "workers.reconciler"], env=env)  # noqa: S603
     time.sleep(0.5)
     return proc
 
 
-def start_payment_worker() -> subprocess.Popen[bytes]:
-    proc = subprocess.Popen(  # noqa: S603
-        [sys.executable, "-m", "workers.payment_worker"], env=dict(os.environ)
-    )
+def start_payment_worker(*, prometheus_multiproc_dir: str) -> subprocess.Popen[bytes]:
+    env = {**os.environ, "PROMETHEUS_MULTIPROC_DIR": prometheus_multiproc_dir}
+    proc = subprocess.Popen([sys.executable, "-m", "workers.payment_worker"], env=env)  # noqa: S603
     time.sleep(0.5)
     return proc
+
+
+# Every api_proc.pid this run has ever spawned, across all scenarios --
+# see _kill_orphaned_uvicorn_workers's own comment for why this is
+# needed: an orphaned worker's `spawn_main(parent_pid=N, ...)` command
+# line records its ORIGINAL parent, and cross-checking N against this
+# set is what lets that cleanup sweep kill only OUR OWN orphans, never
+# an unrelated Python multiprocessing worker elsewhere on the machine.
+_known_api_master_pids: set[int] = set()
 
 
 def start_infra(event_id: int) -> ChaosInfra:
@@ -160,6 +199,7 @@ def start_infra(event_id: int) -> ChaosInfra:
         prometheus_multiproc_dir=PROMETHEUS_MULTIPROC_DIR,
         hold_duration_seconds=HOLD_DURATION_SECONDS,
     )
+    _known_api_master_pids.add(api_proc.pid)
     sweeper_proc = start_sweeper(
         interval_seconds=SWEEPER_INTERVAL_SECONDS,
         batch_size=SWEEPER_BATCH_SIZE,
@@ -168,8 +208,9 @@ def start_infra(event_id: int) -> ChaosInfra:
     reconciler_proc = start_reconciler(
         interval_seconds=RECONCILER_INTERVAL_SECONDS,
         confirm_delay_seconds=RECONCILER_CONFIRM_DELAY_SECONDS,
+        prometheus_multiproc_dir=PROMETHEUS_MULTIPROC_DIR,
     )
-    payment_worker_proc = start_payment_worker()
+    payment_worker_proc = start_payment_worker(prometheus_multiproc_dir=PROMETHEUS_MULTIPROC_DIR)
     return ChaosInfra(
         api_proc=api_proc,
         sweeper_proc=sweeper_proc,
@@ -191,13 +232,83 @@ def stop_infra(infra: ChaosInfra) -> None:
         infra.api_proc,
     ):
         with_suppress_stop(proc)
+    # A single sweep isn't always enough: confirmed directly that a
+    # replacement worker can appear microseconds AFTER one sweep already
+    # ran -- uvicorn's own supervisor, reacting to api_worker_killed's
+    # hard kill of one of its workers, can spawn a replacement in a
+    # window that races this exact teardown. Repeating the sweep for a
+    # few seconds catches a late-arriving one before the NEXT scenario's
+    # start_infra() tries to clear the same shared metrics directory.
+    for _ in range(6):
+        _kill_orphaned_uvicorn_workers()
+        time.sleep(1.0)
+
+
+_SPAWN_MAIN_PARENT_PID_RE = re.compile(r"parent_pid=(\d+)")
+
+
+def _kill_orphaned_uvicorn_workers() -> None:
+    """Belt-and-braces final sweep, NOT relying on walking from
+    api_proc.pid at teardown time: confirmed directly, more than once,
+    that capturing its children BEFORE killing it (with_suppress_stop's
+    own approach) is not sufficient -- the uvicorn MASTER can die on its
+    own sometime after api_worker_killed's scenario hard-kills one of its
+    workers (observed directly: its recorded parent pid was already gone
+    by the time teardown ran), leaving no live pid to walk children FROM
+    at all.
+
+    Every uvicorn --workers child's command line is Python's own
+    `multiprocessing.spawn`'s `spawn_main(parent_pid=N, ...)`, which
+    records its ORIGINAL parent pid literally in the command line even
+    after that parent is long gone. Scanning for that pattern and
+    cross-checking N against _known_api_master_pids (every api_proc.pid
+    THIS run has ever spawned) is what finds these orphans with no
+    process-tree relationship left to find them through -- scoped to our
+    own pids specifically, not a blind kill of anything matching the
+    same generic multiprocessing command line elsewhere on the machine.
+    """
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = " ".join(proc.info["cmdline"] or [])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if "multiprocessing.spawn" not in cmdline or "spawn_main" not in cmdline:
+            continue
+        match = _SPAWN_MAIN_PARENT_PID_RE.search(cmdline)
+        if match and int(match.group(1)) in _known_api_master_pids:
+            print(f"warning: killing orphaned uvicorn worker pid={proc.pid}", file=sys.stderr)
+            actions.kill_pid(proc.pid)
 
 
 def with_suppress_stop(proc: subprocess.Popen[bytes]) -> None:
+    # Capture children BEFORE killing the parent -- once the parent pid
+    # is gone, psutil can no longer walk from it to find them. Confirmed
+    # directly, twice: uvicorn's --workers 4 spawns its actual worker
+    # processes via Python's multiprocessing (spawn_main), and
+    # `taskkill /F /T` (rb.stop_api's own mechanism) does not reliably
+    # catch all of them on Windows -- this run's api_proc left 4 orphaned
+    # worker processes running (correct ppid, still alive) well past
+    # taskkill's own tree-walk, each still holding its own metrics .db
+    # file open, which is exactly what made the NEXT scenario's
+    # _clear_prometheus_multiproc_dir fail. No amount of sleeping between
+    # scenarios fixes an orphan that taskkill never actually reached --
+    # explicitly finding and killing every descendant via psutil (which
+    # walks LIVE parent/child links at call time, not taskkill's own
+    # possibly-stale enumeration) is what actually guarantees no orphan
+    # survives, regardless of timing.
+    children = []
+    with contextlib.suppress(psutil.NoSuchProcess):
+        children = psutil.Process(proc.pid).children(recursive=True)
+
     try:
         rb.stop_api(proc)
     except Exception as exc:  # noqa: BLE001 -- teardown must not abort the whole suite
         print(f"warning: failed to stop pid={proc.pid}: {exc}", file=sys.stderr)
+
+    for child in children:
+        if child.is_running():
+            print(f"warning: killing orphaned child pid={child.pid} of {proc.pid}", file=sys.stderr)
+            actions.kill_pid(child.pid)
 
 
 async def run_one_async(name: str) -> ScenarioReport:
@@ -221,14 +332,18 @@ async def run_one_async(name: str) -> ScenarioReport:
         # A hard taskkill (api_worker_killed's own injection, or the
         # normal /F /T stop above) doesn't guarantee Windows has released
         # a killed worker's memory-mapped metrics .db file the instant it
-        # leaves the process list -- confirmed directly: this run crashed
-        # here once, past _clear_prometheus_multiproc_dir's own 9s retry
-        # budget, immediately after api_worker_killed's hard kill. A
-        # short fixed pause between scenarios is cheap against each
-        # scenario's multi-minute runtime and gives that race more room
-        # to resolve before the NEXT scenario's start_infra() tries to
-        # clear the same directory.
-        await asyncio.sleep(2.0)
+        # leaves the process list -- confirmed directly, twice: this run
+        # crashed here past _clear_prometheus_multiproc_dir's own 9s
+        # retry budget, both times immediately after api_worker_killed's
+        # hard kill (once at 2.0s of pause here, still not enough under a
+        # full seven-scenario run's heavier system load). A fixed pause
+        # between scenarios is cheap against each scenario's multi-minute
+        # runtime; widened from 2.0s to 5.0s after the second occurrence.
+        # If this recurs even at 5.0s, the robust fix is polling
+        # actions.pid_is_running() for the previous scenario's exact PIDs
+        # instead of guessing a duration -- not done here because a
+        # third occurrence hasn't been observed yet to justify it.
+        await asyncio.sleep(5.0)
         ensure_dependencies_up()  # undo anything the scenario's own recover() missed
 
     verdict = "PASSED" if report.passed else "FAILED"
@@ -271,6 +386,13 @@ def main() -> None:
     upgrade_schema()
 
     reports = asyncio.run(async_main(names))
+
+    # Final sweep, even though nothing else in THIS run needs it (that is
+    # exactly why api_worker_killed sorts last in SCENARIOS -- see its
+    # own comment there): an orphaned worker from that scenario would
+    # otherwise outlive this script entirely, leaking a process no next
+    # `make chaos` invocation would ever clean up on its own.
+    _kill_orphaned_uvicorn_workers()
 
     print("\n=== Summary ===")
     for report in reports:

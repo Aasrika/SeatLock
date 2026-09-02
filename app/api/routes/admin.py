@@ -23,7 +23,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import and_, case, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.domain.errors import InvariantViolation
 from app.domain.invariants import (
@@ -73,27 +73,73 @@ async def _get_event_or_404(session: AsyncSession, event_id: int) -> EventRow:
     return event
 
 
-async def _compute_invariants(session: AsyncSession, event: EventRow) -> dict[str, InvariantResult]:
+async def _compute_invariants(
+    session: AsyncSession, event: EventRow
+) -> dict[str, InvariantResult]:
     """Shared by GET /invariants and GET /dashboard -- both need exactly
     this same per-event check, and duplicating it would risk the two
     silently diverging over time.
-    """
-    seat_rows = (
-        (await session.execute(select(SeatRow).where(SeatRow.event_id == event.id))).scalars().all()
-    )
-    seats = [seat_to_domain(row) for row in seat_rows]
 
-    active_seat_ids = set(
-        (
-            await session.execute(
-                select(BookingSeatRow.seat_id)
-                .join(SeatRow, SeatRow.id == BookingSeatRow.seat_id)
-                .where(SeatRow.event_id == event.id, BookingSeatRow.released_at.is_(None))
-            )
+    Opens its OWN fresh session bound to the SAME engine as the caller's
+    `session` (via session.get_bind()) -- deliberately NOT reusing
+    `session` directly, which already ran _get_event_or_404's own query
+    under Postgres's default READ COMMITTED. Found by Phase 8a's chaos
+    suite: the two reads below (seats, then booking_seats) are separate
+    statements, and under READ COMMITTED each statement gets its OWN
+    snapshot, not the whole transaction. A booking confirm's single
+    atomic commit (updating both tables together) landing BETWEEN these
+    two reads produces a torn cross-section -- the OLD seats snapshot
+    (still HELD) alongside the NEW booking_seats snapshot (already
+    active) -- a false positive from THIS CHECKER, not a real data
+    inconsistency (confirmed directly: caught once, under sustained load,
+    as "Seat N has an active booking_seats row but status=HELD").
+    REPEATABLE READ fixes this by fixing the snapshot at the
+    transaction's first statement, so both reads below see the same,
+    single, consistent point in time regardless of what commits elsewhere
+    in between -- but it must be requested before any query runs on that
+    session, which is exactly why this can't just reuse the caller's
+    session, already one query in.
+
+    Deriving the engine from `session.get_bind()` rather than importing
+    app.infra.db's module-level engine directly matters for tests:
+    tests/integration/test_admin_dashboard.py calls get_invariants/
+    get_dashboard with a session bound to the ephemeral testcontainers
+    database, not whatever app.infra.db.engine was bound to at import
+    time -- a hardcoded import here would silently query the wrong
+    database in that context. get_bind() returns the SYNC engine
+    AsyncSession wraps internally, not the AsyncEngine facade
+    async_sessionmaker needs -- AsyncEngine(sync_engine) re-wraps it,
+    backed by the exact same connection pool, not a new one.
+    """
+    engine = AsyncEngine(session.get_bind())
+    consistent_session_factory = async_sessionmaker(bind=engine, expire_on_commit=False)
+    async with consistent_session_factory() as consistent_session:
+        await consistent_session.connection(
+            execution_options={"isolation_level": "REPEATABLE READ"}
         )
-        .scalars()
-        .all()
-    )
+
+        seat_rows = (
+            (
+                await consistent_session.execute(
+                    select(SeatRow).where(SeatRow.event_id == event.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        seats = [seat_to_domain(row) for row in seat_rows]
+
+        active_seat_ids = set(
+            (
+                await consistent_session.execute(
+                    select(BookingSeatRow.seat_id)
+                    .join(SeatRow, SeatRow.id == BookingSeatRow.seat_id)
+                    .where(SeatRow.event_id == event.id, BookingSeatRow.released_at.is_(None))
+                )
+            )
+            .scalars()
+            .all()
+        )
 
     # Every check runs independently -- one invariant failing must never
     # prevent the others from being reported.

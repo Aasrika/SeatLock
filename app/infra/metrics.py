@@ -298,22 +298,27 @@ sweeper_illegal_transition_total = Counter(
     "an entire batch.",
 )
 
-# multiprocess_mode='mostrecent': there is exactly one sweeper process
-# (unlike uvicorn's --workers N), so "the current value" is unambiguous --
-# whichever process last measured it. 'sum'/'max' would be wrong here (this
-# is a single source of truth, not readings from several workers to
-# combine); 'mostrecent' is the one mode that means "the last observation
-# wins," matching a single periodically-refreshed snapshot gauge exactly.
+# multiprocess_mode='mostrecent': not "there is exactly one writer" (there
+# are now two, deliberately -- see below) but "there is exactly one
+# CURRENT VALUE, and it is whoever measured it last." 'sum'/'max' would be
+# wrong here regardless of writer count (this is a single snapshot reading,
+# not per-worker counts to combine); 'mostrecent' is the one mode that
+# means "the last observation wins."
 sweeper_backlog_gauge = Gauge(
     "sweeper_backlog",
     "Count of seats currently HELD with hold_expires_at already passed, "
     "not yet swept -- i.e. how far behind the sweeper is RIGHT NOW. "
-    "Measured by workers/sweeper.py's measure_backlog(), called at the "
-    "start of every sweep pass AND independently of whether a pass is "
-    "running at all (see that function) -- this is how a stopped or "
-    "overloaded sweeper is detected: this number rises with nothing "
-    "sweeping it back down, rather than only being knowable the next "
-    "time a pass happens to run.",
+    "Measured by workers/sweeper.py's measure_backlog(), called from TWO "
+    "independent processes: the sweeper's own loop (every sweep pass), "
+    "AND workers/reconciler.py's loop, on its own separate schedule. The "
+    "second caller exists specifically so this gauge survives the "
+    "sweeper's own death -- Phase 8a's chaos suite found that with only "
+    "the sweeper measuring it, killing the sweeper froze this gauge at "
+    "its last value instead of letting it rise, which is exactly the "
+    "moment a stopped sweeper most needs to be visible. Two independent "
+    "writers to a 'mostrecent' gauge is correct, not a race: there is no "
+    "single source of truth being protected here, only a reading to keep "
+    "fresh.",
     multiprocess_mode="mostrecent",
 )
 

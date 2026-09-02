@@ -130,13 +130,18 @@ async def measure_backlog(session: AsyncSession, now: datetime) -> int:
     a sweep pass is running at all right now.
 
     Called at the start of every sweep_once() pass (keeping the gauge
-    fresh whenever the sweeper is alive), but is equally meaningful called
-    entirely on its own -- e.g. by a separate monitoring probe, or a test
-    simulating "the sweeper has been stopped for a while." That
-    independence is the point: it is how a STOPPED or overloaded sweeper
-    is detected -- this number rising with nothing sweeping it back down
-    -- rather than only being knowable the next time a pass happens to
-    run at all.
+    fresh whenever the sweeper is alive), AND independently by
+    workers/reconciler.py's own loop (a completely separate process, on
+    its own schedule) -- not a hypothetical use, an actual second caller.
+    Phase 8a's chaos suite found the gap this closes: with only the
+    sweeper ever measuring it, killing the sweeper didn't just stop it
+    draining the backlog, it froze the gauge at its last pre-kill value
+    -- the one signal meant to reveal a stopped sweeper went blind at
+    exactly the moment the sweeper died, not merely slow. Two independent
+    writers to the same gauge is correct, not a race, because
+    multiprocess_mode="mostrecent" (app/infra/metrics.py) means "whichever
+    process last measured wins" -- there is no single source of truth to
+    protect here, only a reading to keep fresh.
     """
     count = (
         await session.execute(

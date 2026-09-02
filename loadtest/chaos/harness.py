@@ -40,17 +40,19 @@ for why NOT as a live tail during the run.
 
 from __future__ import annotations
 
+import asyncio
 import bisect
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from loadtest.run_benchmark import _fetch_metrics_text, _http_get_json, _parse_counter_value
 
@@ -85,6 +87,29 @@ def _parse_counter_total(metrics_text: str, metric_name: str) -> float:
 # as-is -- named separately here only so callers don't have to know
 # that distinction.
 _parse_gauge_value = _parse_counter_value
+
+_T = TypeVar("_T")
+
+
+def run_sync_in_thread(coro_fn: Callable[[], Awaitable[_T]]) -> _T:
+    """Run an async callable to completion from plain sync code that may
+    ITSELF already be executing inside a running event loop --
+    run_all.py's async_main() is one long-lived loop for the whole
+    suite (see its own comment on why), and every scenario's inject()/
+    recover() is called synchronously from within it. asyncio.run()
+    would raise "cannot be called from a running event loop" if called
+    directly here; a dedicated thread gets coro_fn a genuinely fresh
+    loop of its own (asyncio.run() is fine there), and .join() blocks
+    the caller until it finishes -- the same shape every scenario's
+    inject()/recover()/run() is already expected to have (synchronous,
+    blocking, no concurrency needed with anything else in this
+    single-purpose orchestration script).
+    """
+    box: list[_T] = []
+    thread = threading.Thread(target=lambda: box.append(asyncio.run(coro_fn())))
+    thread.start()
+    thread.join()
+    return box[0]
 
 
 @dataclass
@@ -374,12 +399,17 @@ class ScenarioReport:
     scenario's verdict depends on hypothesis-specific thresholds only the
     scenario itself knows (e.g. "I3 recovers within one sweeper interval"
     is meaningless to the generic harness).
+
+    result is None for a scenario that doesn't run k6/poll invariants at
+    all (e.g. api_worker_killed_holding_lock.py -- a narrow, deterministic
+    probe of one Postgres setting, not a load scenario) -- there is no
+    timeline to attach in that case.
     """
 
     scenario: str
     passed: bool
     findings: list[str]
-    result: ChaosRunResult
+    result: ChaosRunResult | None
 
 
 def default_k6_env(
