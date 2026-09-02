@@ -46,7 +46,65 @@ harness, not a finding about the product.
 
 ## Fixes made because of this suite, not just found by it
 
-1. **Redis had no `socket_timeout`/`socket_connect_timeout` configured**
+Listed with the invariant checker's own race FIRST, deliberately out of
+discovery order — see its own entry for why it outranks everything else
+here, including the other five measurement failures this project has
+now found (README's "Measurement failures found and corrected" section).
+
+1. **`GET /api/admin/invariants` itself could report a false
+   `booking_linkage` violation under real sustained load** — found not by
+   any of the six scenarios' own hypotheses, but by running the full
+   seven-scenario suite end to end to validate fixes 5 and 6 below.
+   `_compute_invariants` (`app/api/routes/admin.py`) reads `seats` and
+   `booking_seats` as two SEPARATE statements on one session. Postgres's
+   default READ COMMITTED isolation gives each statement its OWN
+   snapshot, not the whole transaction — so a booking confirm's single
+   atomic commit (updating both tables together) landing BETWEEN those
+   two reads produces a torn cross-section: the OLD seats snapshot
+   (still `HELD`) alongside the NEW `booking_seats` snapshot (already
+   active).
+
+   **This is the same flaw as the reconciler's own non-atomic two-store
+   read**, identified and fixed back in Phase 4 with confirm-on-second-
+   look (`workers/reconciler.py` — see README's measurement-failures
+   entry for that fix). The identical pattern — read store A, read store
+   B, treat the pair as if they were observed at one instant when they
+   were not — was sitting in the invariant checker the whole time, on a
+   path trusted since Phase 1, and only surfaced now because it took
+   this many concurrent commits under sustained load to actually land
+   one inside the window. Recognising a failure mode in one component
+   does not mean every other instance of it has been found.
+
+   **Every other measurement failure in this project's history produced
+   a wrong NUMBER.** This one produced a wrong VERDICT. `/api/admin/
+   invariants` is the oracle every benchmark since Phase 3 and every
+   chaos scenario in this document consults to decide pass/fail — it
+   reported a violation that never happened, and by the exact same
+   symmetry, a real violation landing in the opposite half of that same
+   race window would have been silently absorbed into the "old" snapshot
+   and never reported at all. A wrong number misleads whoever reads it.
+   A wrong verdict from the correctness oracle itself is a different
+   order of problem.
+
+   Fixed: `_compute_invariants` now opens its own session with
+   `REPEATABLE READ` isolation, fixing the snapshot at the first
+   statement so both reads see one consistent point in time regardless
+   of what commits elsewhere in between.
+
+   **The verification method is the actual point here, not a detail.**
+   A regression test that passes after a fix proves nothing on its own —
+   it could just as easily be a vacuous assertion, which this exact
+   document has already recorded happening twice (see scenario (d)
+   below). What makes this fix credible: temporarily reverting the
+   isolation level back to `READ COMMITTED` and confirming the new
+   regression test (`tests/integration/test_admin_dashboard.py::
+   TestInvariantsReadSnapshotConsistency`, 200 concurrent confirm-shaped
+   toggles against one seat) reliably FAILS without the fix (40/200
+   false violations), then restoring it and confirming 0/200 with it. A
+   test proves something only once you've watched it fail for the right
+   reason.
+
+2. **Redis had no `socket_timeout`/`socket_connect_timeout` configured**
    (`app/infra/redis.py`). `docker pause redis` (scenario b) proved this
    would have turned a paused cache into hung API requests: both
    `hold_cache.set_hold_mirror()` and `pubsub.publish_seat_update()` are
@@ -55,7 +113,7 @@ harness, not a finding about the product.
    reasoning in `app/infra/config.py`'s comment. Confirmed by test
    (`tests/infra/test_redis.py`) and by scenario (b) below.
 
-2. **A Postgres restart could surface as a bare HTTP 500, not 503**
+3. **A Postgres restart could surface as a bare HTTP 500, not 503**
    (scenario f's stated bar: "If any request returns 500, that is a
    finding to fix, not to document"). Root-caused, iteratively, against a
    real restart under real concurrent load — not guessed:
@@ -84,7 +142,7 @@ harness, not a finding about the product.
      time. The real chaos scenario (below) confirms zero 500s with all
      three in place.
 
-3. **`RealtimeHub._listen_loop` busy-error-looped when nobody was
+4. **`RealtimeHub._listen_loop` busy-error-looped when nobody was
    connected over WebSocket** (`app/realtime/hub.py`) — found
    incidentally (none of these six scenarios touch the WS layer at all;
    this triggered from steady state onward in every run). A `PubSub`
@@ -98,7 +156,7 @@ harness, not a finding about the product.
    by this suite and is a real fix, not because any scenario asserts on
    it.
 
-4. **`sweeper_backlog_gauge` was only ever written by the process it
+5. **`sweeper_backlog_gauge` was only ever written by the process it
    monitors** (`workers/sweeper.py`) — the eighth instrumentation-goes-
    blind-at-the-wrong-moment bug this project has found. Scenario (d)
    found it and, on its first version, DOCUMENTED it as a divergence
@@ -117,7 +175,7 @@ harness, not a finding about the product.
    correctly. See scenario (d) below for the full, honest account of a
    THIRD issue found only after both of these were fixed.
 
-5. **No `idle_in_transaction_session_timeout` on any Postgres
+6. **No `idle_in_transaction_session_timeout` on any Postgres
    connection this app opens** (`app/infra/db.py`). Scenario (e) passed
    without it — but only because every real transaction here is short.
    A worker hard-killed mid-transaction leaves no clean disconnect (the
@@ -131,30 +189,20 @@ harness, not a finding about the product.
    Alembic and testcontainers are unaffected). See the new scenario (e)
    variant below for what actually releases a lock, and what does not.
 
-6. **`GET /api/admin/invariants` itself could report a false
-   `booking_linkage` violation under real sustained load** — found not by
-   any of the six scenarios' own hypotheses, but by running the full
-   seven-scenario suite end to end to validate fixes 4 and 5 above.
-   `_compute_invariants` (`app/api/routes/admin.py`) reads `seats` and
-   `booking_seats` as two SEPARATE statements on one session. Postgres's
-   default READ COMMITTED isolation gives each statement its OWN
-   snapshot, not the whole transaction — so a booking confirm's single
-   atomic commit (updating both tables together) landing BETWEEN those
-   two reads produces a torn cross-section: the OLD seats snapshot
-   (still `HELD`) alongside the NEW `booking_seats` snapshot (already
-   active). This was a bug in the CHECKER, never in the booking data
-   itself — but it is the checker every scenario in this document polls
-   to decide pass/fail, so a false positive here is exactly the kind of
-   thing this whole phase exists to catch. Fixed: `_compute_invariants`
-   now opens its own session with `REPEATABLE READ` isolation, fixing
-   the snapshot at the first statement so both reads see one consistent
-   point in time regardless of what commits elsewhere in between.
-   Verified the fix is real, not another vacuous assertion: temporarily
-   reverted the isolation level back to `READ COMMITTED` and confirmed
-   the new regression test (`tests/integration/test_admin_dashboard.py::
-   TestInvariantsReadSnapshotConsistency`, 200 concurrent confirm-shaped
-   toggles against one seat) reliably fails (40/200 false violations)
-   without the fix, then restored it and confirmed 0/200 with it.
+   **This is a general pattern across the whole suite, not a one-off:
+   hangs are consistently harder to get right than crashes, and only
+   hangs found the missing timeouts.** A hard KILL releases a resource
+   almost immediately, because the OS closes the socket on process
+   death and the peer notices on its very next read — no timeout needed,
+   nothing to configure. A SUSPENDED (or otherwise genuinely
+   unresponsive) peer leaves the resource held with no such signal; only
+   a timeout on the OTHER side ever recovers it. This exact split is
+   what made `docker pause redis` (scenario b) find the missing Redis
+   socket timeout while `docker kill redis` (scenario a) found nothing
+   to fix at all, and it is what makes the kill-vs-suspend sub-tests
+   below find `idle_in_transaction_session_timeout` missing the same
+   way. Across this project, every timeout gap chaos testing has
+   actually found has been found by a hang, never by a crash.
 
 ## Scenario (a): Redis killed (`docker kill`) mid-load
 

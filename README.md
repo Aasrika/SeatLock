@@ -164,18 +164,60 @@ violation from the checker's own read-consistency gap under load. One
 Postgres setting
 (`idle_in_transaction_session_timeout`) was added as a direct result.
 
+**Across this whole suite, hangs were consistently harder to get right
+than crashes — and only hangs ever found a missing timeout.** A hard
+kill releases a resource almost immediately, because the OS closes the
+socket on process death and the peer notices on its very next read; a
+genuinely unresponsive peer (`docker pause`, or a suspended process)
+leaves nothing to notice anything, so only a timeout on the OTHER side
+ever recovers it. This is why `docker pause redis` found the missing
+Redis socket timeout while `docker kill redis` found nothing to fix, and
+why the follow-up variant needed to specifically SUSPEND, not kill, a
+process holding a row lock before `idle_in_transaction_session_timeout`
+turned out to be missing too. See
+[docs/chaos-results.md](docs/chaos-results.md) for both pairs side by
+side.
+
 ---
 
 ## Measurement failures found and corrected
 
-Five cases where this project's own instrumentation returned a
-plausible-looking number that was wrong, and how each was caught. The
-shared pattern across all five: **instrumentation that returns
-plausible numbers while being wrong is worse than instrumentation that
+Nine cases where this project's own instrumentation returned a
+plausible-looking result that was wrong, and how each was caught. The
+shared pattern across all nine: **instrumentation that returns
+plausible results while being wrong is worse than instrumentation that
 fails loudly** — every one of these passed as a well-formed result
 before it was interrogated.
 
-1. **The acquire-only sweep was measuring rejection cost, not
+The first is listed out of discovery order, deliberately, because it
+outranks the other eight: they each produced a wrong NUMBER; this one
+produced a wrong VERDICT.
+
+1. **The invariant checker itself could report a violation that never
+   happened.** `GET /api/admin/invariants` — the oracle every benchmark
+   since Phase 3 and every chaos scenario in this project consults to
+   decide pass/fail — read `seats` and `booking_seats` as two separate
+   statements under Postgres's default READ COMMITTED isolation. A
+   booking confirm's single atomic commit landing between those two
+   reads produced a torn cross-section: the old `seats` snapshot next to
+   the new `booking_seats` one. This is the identical flaw as case 6
+   below (the reconciler's own non-atomic two-store read, found and
+   fixed back in Phase 4) — sitting on a DIFFERENT path, trusted since
+   Phase 1, only surfacing once enough concurrent commits under
+   sustained load happened to land inside the window. Recognising a
+   failure mode once does not mean every instance of it has been found.
+   By the same symmetry that let it report a false violation, a real one
+   landing in the other half of that race window would have been
+   silently absorbed and never reported at all — a wrong verdict from
+   the correctness oracle is a different order of problem than a wrong
+   number anywhere else. Fixed with a dedicated `REPEATABLE READ`
+   session, and verified the fix is real rather than another vacuous
+   assertion (case 9 below is exactly that trap) by temporarily
+   reverting to `READ COMMITTED` and confirming the regression test
+   reliably FAILS without the fix before confirming it passes with it —
+   a test proves something only once you've watched it fail for the
+   right reason. [docs/chaos-results.md](docs/chaos-results.md).
+2. **The acquire-only sweep was measuring rejection cost, not
    contention.** The first version of the three-strategy sweep found
    optimistic leading pessimistic at every contention ratio, with
    non-overlapping ranges — a clean, confident result. Splitting each
@@ -185,7 +227,7 @@ before it was interrogated.
    differently (optimistic: no lock; pessimistic: acquire the lock,
    *then* discover it's too late). The gap was real but measured the
    wrong thing. [Phase 3, Parts 1–2](docs/benchmarks/phase3-crossover.md#part-1--v1-the-acquire-only-coarse-sweep).
-2. **`oversold_seats` became meaningless the moment seats recirculated.**
+3. **`oversold_seats` became meaningless the moment seats recirculated.**
    An early smoke test reported `pessimistic oversold_seats = 30` — a
    strategy that cannot oversell by construction. The metric's
    definition ("flag any seat with more than one distinct holder,
@@ -193,7 +235,7 @@ before it was interrogated.
    for a recirculating one, where the same seat legitimately has many
    sequential holders. Replaced with a time-aware overlap check against
    `hold_audit`. [Phase 3, Part 4](docs/benchmarks/phase3-crossover.md#part-4--the-oversell-metric-definition-failure).
-3. **`fraction_available` kept polling raw seat status after lazy
+4. **`fraction_available` kept polling raw seat status after lazy
    expiry changed what "available" meant.** Re-running the sweep at the
    production 5-second sweeper interval, this validity metric collapsed
    to 0.032–0.205 everywhere — including at the least contested ratio,
@@ -202,7 +244,7 @@ before it was interrogated.
    before the sweeper physically flips it. The metric never raised an
    error — it just stopped measuring what its name said it measured.
    [Phase 3, Appendix](docs/benchmarks/phase3-crossover.md#the-invalid-measurement-fraction_available-under-lazy-expiry).
-4. **A real lazy-expiry bug survived a targeted audit because it was
+5. **A real lazy-expiry bug survived a targeted audit because it was
    written in raw SQL.** The same production-interval re-run also
    revealed that optimistic locking's conditional `UPDATE` still
    required `status = 'AVAILABLE'` literally — every expired-but-
@@ -214,7 +256,7 @@ before it was interrogated.
    because the rule was spelled `status = 'AVAILABLE'` inside a string.
    An audit is only as good as its ability to see every place a rule is
    expressed. [Phase 3, Appendix](docs/benchmarks/phase3-crossover.md#two-lazy-expiry-bugs-found-two-different-ways).
-5. **The reconciler's own non-atomic read was inflating the metric it
+6. **The reconciler's own non-atomic read was inflating the metric it
    exists to keep meaningful.** Postgres and Redis can't be read
    atomically together, so a single comparison pass can catch a seat
    mid-transition and report it as diverged when nothing is actually
@@ -223,6 +265,40 @@ before it was interrogated.
    drift stopped being visible too. Fixed with confirm-on-second-look:
    a candidate is re-read after a short delay before it counts as a
    real divergence. [`workers/reconciler.py`](workers/reconciler.py).
+7. **The chaos harness's own metric reader silently returned 0.0 for
+   every labeled counter, always.** `hold_cache_errors_total` and
+   `reconciliation_divergence_total` (both labeled) were read with a
+   parser built for label-less counters only — it matched a line prefix
+   that never appears once a metric carries a label, so it quietly read
+   zero regardless of the real value, for two entire chaos scenarios,
+   before anyone compared the "before" and "after" and noticed neither
+   had ever moved. Fixed with a parser that sums across every label
+   combination. [docs/chaos-results.md](docs/chaos-results.md).
+8. **A live per-request outcome timeline built by tailing k6's own
+   output mid-run misattributed events across window boundaries.** k6
+   buffers its `--out json` writer, so "lines visible on disk at poll
+   time T" lagged behind "requests that actually happened at time T" —
+   a scenario's own narrow inject/recover window came back reporting
+   zero of the outcomes that DID happen inside it, attributed instead to
+   whichever later poll finally saw the buffered lines. Fixed by parsing
+   the complete output once, after the run, bucketed by each event's own
+   recorded timestamp instead of by when this process happened to read
+   it. [docs/chaos-results.md](docs/chaos-results.md).
+9. **`sweeper_backlog_gauge` was only ever written by the process it
+   monitors, so killing the sweeper didn't just stop it draining the
+   backlog — it stopped the measurement too**, freezing the gauge at its
+   last value instead of letting it rise, exactly when a stopped sweeper
+   most needed to be visible. A scenario built to prove this passed
+   twice regardless, for two different reasons that were never actually
+   about the sweeper: the frozen gauge simply couldn't fail the
+   assertion either way (a passing test with a dead assertion inside
+   it), and after fixing that, real load reclaiming every contended seat
+   before anything could go unswept made the backlog look zero on its
+   own merits. Fixed by having the reconciler measure the same gauge
+   independently, on its own schedule, and by reserving a handful of
+   seats k6 never contends for so there is a genuine, uncontended
+   backlog to observe going up and coming back down.
+   [docs/chaos-results.md](docs/chaos-results.md).
 
 ---
 
