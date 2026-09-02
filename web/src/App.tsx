@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { AdminDashboardPage } from "./pages/AdminDashboardPage";
 import { SeatMapPage } from "./pages/SeatMapPage";
+import { WalkthroughPage } from "./pages/WalkthroughPage";
 
 function readEventIdFromUrl(): number {
   const params = new URLSearchParams(window.location.search);
@@ -11,7 +12,7 @@ function readEventIdFromUrl(): number {
 
 export function App() {
   const eventId = useMemo(() => readEventIdFromUrl(), []);
-  const [page, setPage] = useState<"seats" | "admin">("seats");
+  const [page, setPage] = useState<"seats" | "admin" | "walkthrough">("seats");
 
   return (
     <div className="app">
@@ -22,12 +23,17 @@ export function App() {
         <button type="button" onClick={() => setPage("admin")} disabled={page === "admin"}>
           Admin
         </button>
+        <button
+          type="button"
+          onClick={() => setPage("walkthrough")}
+          disabled={page === "walkthrough"}
+        >
+          Walkthrough
+        </button>
       </nav>
-      {page === "seats" ? (
-        <SeatMapPage eventId={eventId} />
-      ) : (
-        <AdminDashboardPage eventId={eventId} />
-      )}
+      {page === "seats" && <SeatMapPage eventId={eventId} />}
+      {page === "admin" && <AdminDashboardPage eventId={eventId} />}
+      {page === "walkthrough" && <WalkthroughPage eventId={eventId} />}
     </div>
   );
 }

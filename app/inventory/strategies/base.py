@@ -16,12 +16,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 @dataclass
 class AcquireResult:
-    """The outcome of one acquire() call."""
+    """The outcome of one acquire() call.
+
+    attempts: the literal count of acquisition attempts MADE, by every
+    strategy, on every return path -- never "1 meaning no retries" for
+    naive/pessimistic and something else for optimistic. Those two never
+    retry internally, so every return is attempts=1; optimistic's own
+    retry loop sets it to whichever iteration actually returned (1 on an
+    immediate win or an unretryable rejection, up to max_attempts on
+    exhaustion). Defaults to 0, not 1, so a caller that forgets to set it
+    gets an obviously-wrong sentinel instead of a silently-plausible
+    "one attempt" -- added for the walkthrough page's race demo (Phase
+    9), which reports this per attempt.
+    """
 
     success: bool
     acquired: list[int]
     failed: list[int]
     reason: str | None = None
+    attempts: int = 0
 
 
 class StrategyUnavailable(Exception):

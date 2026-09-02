@@ -255,5 +255,29 @@ class Settings(BaseSettings):
     # single serialize-and-send per section.
     ws_coalesce_window_ms: float = 100.0
 
+    # --- Phase 9: interactive walkthrough (SPEC.md has no section for
+    # this yet -- it is a portfolio/interview artifact, not a product
+    # feature) ----------------------------------------------------------
+    #
+    # app/api/routes/demo.py's whole router is gated behind this,
+    # defaulting OFF: those endpoints let a caller choose the
+    # deliberately-broken naive strategy per request (POST /api/demo/race
+    # takes `strategy` in its body) and spawn arbitrary concurrent
+    # acquisition load against one seat. Exposing that ungated would let
+    # any caller pick the unsafe path against a real deployment -- fine
+    # for a local/interview demo, never fine as a default. Every demo
+    # route 404s (not 403 -- the routes should look like they don't
+    # exist, not like a locked door worth trying to pick) when this is
+    # false.
+    demo_mode: bool = False
+    # Only ever used by the demo hold-lifecycle endpoint
+    # (POST /api/demo/hold) -- a walkthrough for an interviewer needs a
+    # hold that visibly expires within the ~90 seconds the whole page is
+    # meant to take, not the product's real 480s
+    # (Settings.hold_duration_seconds, left untouched by this feature
+    # entirely). 8s: long enough to read the countdown and understand
+    # what's being shown, short enough that nobody sits waiting.
+    demo_default_hold_duration_seconds: float = 8.0
+
 
 settings = Settings()

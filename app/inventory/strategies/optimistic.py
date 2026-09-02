@@ -242,7 +242,11 @@ class OptimisticStrategy:
             if missing:
                 await session.rollback()
                 return AcquireResult(
-                    success=False, acquired=[], failed=missing, reason="seat_not_found"
+                    success=False,
+                    acquired=[],
+                    failed=missing,
+                    reason="seat_not_found",
+                    attempts=attempt,
                 )
 
             # (b) validate against exactly what we just read. A rejection
@@ -256,7 +260,11 @@ class OptimisticStrategy:
                     oversell_blocked_total.labels(layer="application").inc()
                     await session.rollback()
                     return AcquireResult(
-                        success=False, acquired=[], failed=[seat_id], reason=str(exc)
+                        success=False,
+                        acquired=[],
+                        failed=[seat_id],
+                        reason=str(exc),
+                        attempts=attempt,
                     )
                 expected_versions[seat_id] = seat.version
 
@@ -274,7 +282,7 @@ class OptimisticStrategy:
                     session.add(HoldAuditRow(seat_id=seat_id, session_id=holder, acquired_at=now))
                 await session.commit()
                 optimistic_attempts.observe(attempt)
-                return AcquireResult(success=True, acquired=seat_ids, failed=[])
+                return AcquireResult(success=True, acquired=seat_ids, failed=[], attempts=attempt)
 
             # (d) conflict: at least one row's version no longer matched
             # what we read. Roll back (undoes any rows THIS statement did
@@ -294,6 +302,7 @@ class OptimisticStrategy:
             acquired=[],
             failed=seat_ids,
             reason=f"retry_budget_exhausted after {self.max_attempts} attempts",
+            attempts=self.max_attempts,
         )
 
     async def _attempt_update(

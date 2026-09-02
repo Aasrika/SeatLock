@@ -1,0 +1,376 @@
+/* Interactive walkthrough page (web's third tab). Scoped under
+   .walkthrough so the existing Seat map / Admin tabs are untouched.
+
+   Palette: validated status/neutral values from this repo's dataviz
+   skill reference palette (references/palette.md) -- not invented here.
+   Status colors are RESERVED and always paired with a text label, never
+   color alone (warning/serious sit under 3:1 contrast on a light
+   surface by that reference's own measurements -- the label is the
+   mitigation, not decoration). One accent (categorical slot 1, blue)
+   for interactive elements; everything else is neutral. No gradients,
+   no shadows, no decorative color -- Linear/Stripe-dashboard density,
+   not a portfolio hero. Light mode only: this is a scoped interview
+   artifact, not a themed product surface, and a real dark mode is out
+   of scope for the time this page gets. */
+
+.walkthrough {
+  --surface-1: #fcfcfb;
+  --surface-2: #f5f4f2;
+  --border: #e0dfdb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #8a8983;
+  --accent: #2a78d6;
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", monospace;
+
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.4;
+  max-width: 960px;
+}
+
+.walkthrough * {
+  box-sizing: border-box;
+}
+
+.walkthrough h2 {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+.walkthrough h3 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  margin: 0 0 8px;
+}
+
+.wt-intro {
+  color: var(--text-secondary);
+  margin: 0 0 16px;
+  max-width: 72ch;
+}
+
+.wt-section {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 16px;
+  margin-bottom: 16px;
+  background: var(--surface-1);
+}
+
+.wt-section-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.wt-mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.wt-row {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.wt-col {
+  flex: 1;
+  min-width: 0;
+}
+
+.wt-prediction {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 8px 0;
+}
+
+.wt-prediction strong {
+  color: var(--text-primary);
+}
+
+.wt-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.wt-select,
+.wt-button,
+.wt-input {
+  font: inherit;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 5px 8px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+
+.wt-button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.wt-button:disabled {
+  background: var(--text-muted);
+  border-color: var(--text-muted);
+  cursor: default;
+}
+
+.wt-button--secondary {
+  background: var(--surface-1);
+  color: var(--text-primary);
+  border-color: var(--border);
+}
+
+.wt-slider-value {
+  font-family: var(--mono);
+  min-width: 3ch;
+  text-align: right;
+}
+
+/* Status labels ALWAYS carry text, never color alone -- see this
+   file's own header comment. */
+.wt-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 2px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.wt-status--good {
+  color: var(--status-good);
+  background: color-mix(in srgb, var(--status-good) 12%, transparent);
+}
+
+.wt-status--warning {
+  color: #8a5a00;
+  background: color-mix(in srgb, var(--status-warning) 20%, transparent);
+}
+
+.wt-status--critical {
+  color: var(--status-critical);
+  background: color-mix(in srgb, var(--status-critical) 12%, transparent);
+}
+
+.wt-status--neutral {
+  color: var(--text-secondary);
+  background: var(--surface-2);
+}
+
+.wt-attempts {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 320px;
+  overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.wt-attempt-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 3px 6px;
+  border-radius: 2px;
+  /* Justified animation: makes N simultaneous outcomes legible one at a
+     time instead of arriving as an unreadable single paint -- the
+     stagger is keyed to each attempt's own real latency (see
+     RaceSection), not decorative timing. */
+  animation: wt-attempt-reveal 180ms ease-out both;
+}
+
+@keyframes wt-attempt-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.wt-attempt-row--acquired {
+  background: color-mix(in srgb, var(--status-good) 8%, transparent);
+}
+
+.wt-attempt-row--error {
+  background: color-mix(in srgb, var(--status-critical) 8%, transparent);
+}
+
+.wt-result-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  margin: 10px 0;
+  font-size: 13px;
+}
+
+.wt-result-banner--held-correctly {
+  border-color: color-mix(in srgb, var(--status-good) 40%, var(--border));
+}
+
+.wt-result-banner--oversold {
+  border-color: color-mix(in srgb, var(--status-critical) 40%, var(--border));
+}
+
+.wt-invariant-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wt-invariant-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.wt-invariant-disclosure {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.wt-invariant-disclosure a {
+  color: var(--accent);
+}
+
+.wt-state-machine {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  margin: 8px 0;
+}
+
+.wt-sm-node {
+  border: 1.5px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--surface-1);
+  transition: border-color 150ms, background 150ms, color 150ms;
+}
+
+.wt-sm-node--active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.wt-sm-arrow {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.wt-raw-vs-computed {
+  display: flex;
+  gap: 20px;
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 8px 0;
+}
+
+.wt-raw-vs-computed dt {
+  color: var(--text-muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 2px;
+}
+
+.wt-raw-vs-computed dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+.wt-error {
+  color: var(--status-critical);
+  font-size: 12px;
+}
+
+.wt-copy-command {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 6px 0;
+}
+
+.wt-copy-command-label {
+  color: var(--text-secondary);
+  min-width: 180px;
+}
+
+.wt-copy-command code {
+  flex: 1;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .wt-row {
+    flex-direction: column;
+  }
+
+  /* At 480px, a fixed 180px label plus a Copy button leaves no room
+     for a docker command to be legible -- it just clips mid-word (a
+     real bug this narrow-viewport-first page exists to catch). Stack
+     label above command instead of packing both into one row; the
+     command itself still scrolls horizontally rather than wrapping,
+     since a command needs to stay copy-paste-exact on one line. */
+  .wt-copy-command {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .wt-copy-command-label {
+    min-width: 0;
+  }
+}

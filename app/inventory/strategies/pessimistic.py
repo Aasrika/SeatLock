@@ -140,7 +140,7 @@ class PessimisticStrategy:
         if missing:
             await session.rollback()
             return AcquireResult(
-                success=False, acquired=[], failed=missing, reason="seat_not_found"
+                success=False, acquired=[], failed=missing, reason="seat_not_found", attempts=1
             )
 
         for seat_id in seat_ids:
@@ -150,10 +150,12 @@ class PessimisticStrategy:
             except DomainError as exc:
                 oversell_blocked_total.labels(layer="application").inc()
                 await session.rollback()
-                return AcquireResult(success=False, acquired=[], failed=[seat_id], reason=str(exc))
+                return AcquireResult(
+                    success=False, acquired=[], failed=[seat_id], reason=str(exc), attempts=1
+                )
 
         await self._commit_holds(session, seat_ids, holder, hold_duration, now)
-        return AcquireResult(success=True, acquired=seat_ids, failed=[])
+        return AcquireResult(success=True, acquired=seat_ids, failed=[], attempts=1)
 
     async def acquire_any_n(
         self,
@@ -228,6 +230,7 @@ class PessimisticStrategy:
                 acquired=[],
                 failed=list(rows.keys()),
                 reason=f"insufficient_availability: found {len(rows)} of {count} requested",
+                attempts=1,
             )
 
         seat_ids = list(rows.keys())
@@ -238,10 +241,12 @@ class PessimisticStrategy:
             except DomainError as exc:
                 oversell_blocked_total.labels(layer="application").inc()
                 await session.rollback()
-                return AcquireResult(success=False, acquired=[], failed=[seat_id], reason=str(exc))
+                return AcquireResult(
+                    success=False, acquired=[], failed=[seat_id], reason=str(exc), attempts=1
+                )
 
         await self._commit_holds(session, seat_ids, holder, hold_duration, now)
-        return AcquireResult(success=True, acquired=seat_ids, failed=[])
+        return AcquireResult(success=True, acquired=seat_ids, failed=[], attempts=1)
 
     async def _set_lock_timeout(self, session: AsyncSession) -> None:
         # The first statement of the transaction -- whichever it is --

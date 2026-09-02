@@ -67,7 +67,7 @@ class NaiveStrategy:
         missing = [seat_id for seat_id in seat_ids if seat_id not in rows]
         if missing:
             return AcquireResult(
-                success=False, acquired=[], failed=missing, reason="seat_not_found"
+                success=False, acquired=[], failed=missing, reason="seat_not_found", attempts=1
             )
 
         # This delay exists ONLY to make the race reproducible on demand.
@@ -88,7 +88,9 @@ class NaiveStrategy:
             try:
                 held_seats[seat_id] = state_machine.hold(seat, holder, now, hold_duration)
             except DomainError as exc:
-                return AcquireResult(success=False, acquired=[], failed=[seat_id], reason=str(exc))
+                return AcquireResult(
+                    success=False, acquired=[], failed=[seat_id], reason=str(exc), attempts=1
+                )
 
         # Step 3: write back -- unconditionally. seat_apply() only sets
         # attributes on the already-loaded ORM row; SQLAlchemy's flush
@@ -100,4 +102,4 @@ class NaiveStrategy:
 
         await session.commit()
 
-        return AcquireResult(success=True, acquired=list(held_seats.keys()), failed=[])
+        return AcquireResult(success=True, acquired=list(held_seats.keys()), failed=[], attempts=1)

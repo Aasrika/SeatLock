@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
-from app.api.routes import admin, booking, bookings, metrics, webhooks, ws
+from app.api.routes import admin, booking, bookings, demo, metrics, webhooks, ws
 from app.infra.config import settings
 from app.infra.db import async_session_factory, engine
 from app.infra.redis import get_redis
@@ -60,6 +60,10 @@ app.include_router(webhooks.router, prefix="/api", tags=["webhooks"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(metrics.router, tags=["metrics"])
 app.include_router(ws.router, tags=["realtime"])
+# Always registered, gated at the route level (require_demo_mode, 404
+# when Settings.demo_mode is off) rather than conditionally included --
+# see app/api/routes/demo.py's own module docstring.
+app.include_router(demo.router, prefix="/api/demo", tags=["demo"])
 
 
 @app.exception_handler(StrategyUnavailable)
